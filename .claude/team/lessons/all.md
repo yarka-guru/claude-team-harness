@@ -1,0 +1,1 @@
+<!-- One line per lesson: "- <imperative rule> (<evidence: date, card, what went wrong>)". all.md is injected into every agent, <agent-type>.md only into that role; the retro keeps each file under 15 lines. -->

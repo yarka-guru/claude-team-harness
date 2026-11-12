@@ -1,0 +1,11 @@
+.claude/team/state/
+.claude/team/rituals/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+*.log
+*.pid
+.claude/settings.local.json
+.claude/backup/
+.DS_Store
