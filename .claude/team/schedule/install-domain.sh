@@ -6,17 +6,23 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo "install-domain.sh supports macOS only (pf, launchd); open http://127.0.0.1:${TEAM_PORT:-7777} instead" >&2
   exit 1
 fi
-host="${TEAM_HOST:-team.test}"
+host="${TEAM_HOST:-mission.control}"
 port="${TEAM_PORT:-7777}"
+backend="${TEAM_BACKEND_PORT:-}"
 mark="# claude-team"
 label="com.claude-team.domain"
 anchor="com.apple/claude-team"
 if ! [[ "$host" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-  echo "TEAM_HOST must be a lowercase dotted name like team.test, got: $host" >&2
+  echo "TEAM_HOST must be a lowercase dotted name like mission.control, got: $host" >&2
   exit 1
 fi
 if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$port < 1024 || 10#$port > 65535 )); then
   echo "TEAM_PORT must be 1024-65535, got: $port" >&2
+  exit 1
+fi
+[[ -n "$backend" ]] || backend=$((10#$port + 1))
+if ! [[ "$backend" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$backend < 1024 || 10#$backend > 65535 || 10#$backend == 10#$port )); then
+  echo "TEAM_BACKEND_PORT must be 1024-65535 and differ from TEAM_PORT, got: $backend" >&2
   exit 1
 fi
 case "$host" in
@@ -40,6 +46,9 @@ if [[ -n "${TEAM_ETC:-}" ]]; then
   state="$TEAM_ETC/db/claude-team"
   pfctl="${TEAM_PFCTL:-}"
   ifconfig="${TEAM_IFCONFIG:-}"
+  lsof="${TEAM_LSOF:-}"
+  nc="${TEAM_NC:-}"
+  curl="${TEAM_CURL:-}"
 else
   live=1
   etc=/etc
@@ -47,6 +56,9 @@ else
   state=/var/db/claude-team
   pfctl=/sbin/pfctl
   ifconfig=/sbin/ifconfig
+  lsof=/usr/sbin/lsof
+  nc=/usr/bin/nc
+  curl=/usr/bin/curl
   if (( EUID != 0 )); then
     echo "run with sudo: sudo $0" >&2
     exit 1
@@ -65,6 +77,10 @@ xml() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
 }
 
+pids_on() {
+  if [[ -n "$lsof" ]]; then "$lsof" -t -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | sort -u || true; fi
+}
+
 hosts="$etc/hosts"
 hops=0
 while [[ -L "$hosts" ]]; do
@@ -81,9 +97,71 @@ if (( live )) && [[ "$(stat -f %u "$(dirname "$hosts")")" != 0 ]]; then
   exit 1
 fi
 
+here="$(cd "$(dirname "$0")" && pwd)"
+on_port=$(pids_on "$port")
+on_backend=$(pids_on "$backend")
+listening=0
+[[ -n "$on_port" ]] && listening=1
+for pid in $on_backend; do
+  if ! grep -qx "$pid" <<< "$on_port"; then
+    echo "127.0.0.1:$backend is already in use by another program, and the redirect would make it unreachable for direct connections:" >&2
+    "$lsof" -nP -iTCP:"$backend" -sTCP:LISTEN >&2 || true
+    echo "pick a free port for the redirect: sudo TEAM_BACKEND_PORT=<port> $0" >&2
+    exit 1
+  fi
+done
+prev=$(awk '/ # claude-team[ \t\r]*$/ {print $2; exit}' "$hosts" 2>/dev/null || true)
+
 mkdir -p "$state"
 chmod 755 "$state"
 [[ -e "$state/hosts.bak" ]] || cp -p "$hosts" "$state/hosts.bak"
+
+undo() {
+  local ours left=""
+  ours=$(cat "$state/alias" 2>/dev/null || true)
+  echo "FAIL: $1" >&2
+  echo "undoing the whole install with $here/uninstall-domain.sh:" >&2
+  if ! /bin/bash "$here/uninstall-domain.sh" >&2; then
+    echo "FAIL: uninstall-domain.sh failed; run it again: sudo $here/uninstall-domain.sh" >&2
+    exit 1
+  fi
+  [[ -e "$daemons/$label.plist" ]] && left="$left $daemons/$label.plist"
+  [[ -e "$etc/pf.anchors/claude-team" ]] && left="$left $etc/pf.anchors/claude-team"
+  [[ -e "$state" ]] && left="$left $state"
+  grep -q ' # claude-team[[:space:]]*$' "$hosts" && left="$left the-marked-line-in-$hosts"
+  [[ -n "$(pf -a "$anchor" -s nat 2>/dev/null || true)" ]] && left="$left rules-in-pf-anchor-$anchor"
+  if [[ -n "$ours" && "$(ifc lo0 || true)" == *"inet $ours "* ]]; then left="$left lo0-alias-$ours"; fi
+  if [[ -n "$left" ]]; then
+    echo "FAIL: still present after the undo:$left" >&2
+  else
+    echo "undone: no LaunchDaemon, anchor file, pf rules, pf enable reference, alias we added, hosts line or $state is left" >&2
+  fi
+  if [[ -n "$prev" ]]; then
+    echo "The previous install (http://$prev) is removed as well: the local domain is now uninstalled." >&2
+  fi
+  echo "The dashboard stays at http://127.0.0.1:$port. Details for a bug report: sudo $here/diag-domain.sh /tmp/claude-team-diag.txt" >&2
+  exit 1
+}
+
+tmp=""
+trap 'if [[ -n "$tmp" ]]; then rm -f "$tmp"; fi' EXIT
+
+write_hosts() {
+  tmp=$(mktemp "$(dirname "$hosts")/.hosts.XXXXXX")
+  perl -ne 'print unless / \Q# claude-team\E[ \t\r]*$/' "$hosts" > "$tmp"
+  if [[ -s "$tmp" && -n "$(tail -c 1 "$tmp")" ]]; then
+    printf '\n' >> "$tmp"
+    touch "$state/hosts.nonl"
+  fi
+  printf '%s %s %s\n' "$addr" "$host" "$mark" >> "$tmp"
+  chmod 644 "$tmp"
+  if (( live )); then chown root:wheel "$tmp"; fi
+  mv -f "$tmp" "$hosts"
+  if (( live )); then
+    dscacheutil -flushcache
+    killall -HUP mDNSResponder
+  fi
+}
 
 old=""
 [[ -f "$state/alias" ]] && old=$(cat "$state/alias")
@@ -97,20 +175,9 @@ if [[ "$addr" != 127.0.0.1 && ! -f "$state/alias" && "$lo" != *"inet $addr "* ]]
   echo "$addr" > "$state/alias"
 fi
 
-tmp=$(mktemp "$(dirname "$hosts")/.hosts.XXXXXX")
-trap 'rm -f "$tmp"' EXIT
-perl -ne 'print unless / \Q# claude-team\E[ \t\r]*$/' "$hosts" > "$tmp"
-if [[ -s "$tmp" && -n "$(tail -c 1 "$tmp")" ]]; then
-  printf '\n' >> "$tmp"
-  touch "$state/hosts.nonl"
-fi
-printf '%s %s %s\n' "$addr" "$host" "$mark" >> "$tmp"
-chmod 644 "$tmp"
-if (( live )); then chown root:wheel "$tmp"; fi
-mv -f "$tmp" "$hosts"
-
 mkdir -p "$etc/pf.anchors"
-printf 'rdr pass on lo0 inet proto tcp from any to %s port 80 -> 127.0.0.1 port %s\n' "$addr" "$port" > "$etc/pf.anchors/claude-team"
+printf '# claude-team port=%s backend=%s\nrdr pass on lo0 inet proto tcp from any to %s port 80 -> 127.0.0.1 port %s\n' \
+  "$port" "$backend" "$addr" "$backend" > "$etc/pf.anchors/claude-team"
 chmod 644 "$etc/pf.anchors/claude-team"
 
 if [[ ! -f "$state/pf.prior" ]]; then
@@ -163,28 +230,24 @@ if (( live )); then
     [[ "$(cat "$state/pf.token" 2>/dev/null || true)" != "$before" ]] && break
     sleep 1
   done
-  dscacheutil -flushcache
-  killall -HUP mDNSResponder
 else
   echo "would run: launchctl bootstrap system $plist (RunAtLoad runs $boot)"
-  if [[ -n "$pfctl" && -n "$ifconfig" ]]; then
-    if ! /bin/bash "$boot"; then
-      echo "boot.sh failed; the previous pf token was kept" >&2
-      exit 1
-    fi
+  if [[ -n "$pfctl" && -n "$ifconfig" ]] && ! /bin/bash "$boot"; then
+    echo "boot.sh failed (the previous pf token was kept)" >&2
   fi
 fi
 
-echo "host $host, address $addr, port 80 -> 127.0.0.1:$port"
+echo "host $host, address $addr, port 80 -> 127.0.0.1:$backend (the dashboard's backend listener, reachable only through the redirect; direct use stays on 127.0.0.1:$port)"
 if (( ! live )) && [[ -z "$pfctl" || -z "$ifconfig" ]]; then
+  write_hosts
   echo "dry run without TEAM_PFCTL and TEAM_IFCONFIG: boot.sh not run, pf checks skipped"
   exit 0
 fi
 ok=1
-if [[ "$(pf -a "$anchor" -s nat 2>/dev/null || true)" =~ to\ ${addr//./\\.}\ port\ (=\ )?80\ -\>\ 127\.0\.0\.1\ port\ (=\ )?$port ]]; then
-  echo "ok: pf anchor $anchor redirects $addr:80 to 127.0.0.1:$port"
+if [[ "$(pf -a "$anchor" -s nat 2>/dev/null || true)" =~ to\ ${addr//./\\.}\ port\ (=\ )?80\ -\>\ 127\.0\.0\.1\ port\ (=\ )?$backend ]]; then
+  echo "ok: pf anchor $anchor redirects $addr:80 to 127.0.0.1:$backend"
 else
-  echo "FAIL: pf anchor $anchor has no rdr rule for $addr:80 (see $state/boot.log)" >&2
+  echo "FAIL: pf anchor $anchor has no rdr rule for $addr:80 -> 127.0.0.1:$backend (see $state/boot.log)" >&2
   ok=0
 fi
 if [[ "$(pf -s info 2>/dev/null || true)" == *"Status: Enabled"* ]]; then
@@ -198,13 +261,39 @@ if grep -Eq '^[[:space:]]*rdr-anchor[[:space:]]+"com\.apple/\*"' "$etc/pf.conf" 
 else
   echo "WARNING: $etc/pf.conf has no rdr-anchor \"com.apple/*\" line, so the redirect is never evaluated; add it or load the anchor from your own pf.conf" >&2
 fi
-if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-  echo "ok: something listens on 127.0.0.1:$port"
-else
-  echo "WARNING: nothing listens on 127.0.0.1:$port yet; start the dashboard (python3 .claude/team/team.py dashboard start)" >&2
-fi
 if (( ! ok )); then
-  echo "the redirect is not in place" >&2
+  undo "the redirect is not in place"
+fi
+write_hosts
+if [[ -z "$lsof" || -z "$nc" || -z "$curl" ]]; then
+  echo "dry run without TEAM_LSOF, TEAM_NC and TEAM_CURL: connection checks skipped"
+  exit 0
+fi
+if (( ! listening )); then
+  echo "WARNING: nothing listened on 127.0.0.1:$port before the install, so the direct and domain checks are skipped; start the dashboard and run this script again" >&2
+  echo "installed: http://$host (unchecked)"
+  exit 0
+fi
+direct=0
+for _ in 1 2 3; do
+  if "$nc" -z -G 2 -w 2 127.0.0.1 "$port" >/dev/null 2>&1; then direct=1; break; fi
+  sleep 1
+done
+if (( ! direct )); then
+  undo "after loading the redirect, TCP connections to 127.0.0.1:$port time out although a server listened there before"
+fi
+echo "ok: 127.0.0.1:$port still answers direct connections"
+served=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if "$curl" -s -I --max-time 2 "http://$host/" 2>/dev/null | tr -d '\r' | grep -qi '^server: team-dashboard'; then served=1; break; fi
+  sleep 1
+done
+if (( ! served )); then
+  echo "FAIL: http://$host/ did not answer with the dashboard within 10 s. The redirect stays installed." >&2
+  echo "      A dashboard of this version opens 127.0.0.1:$backend by itself within a few seconds; one started on an older version does not." >&2
+  echo "      Restart it: python3 $(dirname "$here")/team.py dashboard stop && python3 $(dirname "$here")/team.py dashboard start" >&2
+  echo "      If it still fails: sudo $here/diag-domain.sh /tmp/claude-team-diag.txt" >&2
   exit 1
 fi
+echo "ok: http://$host/ answers with the dashboard"
 echo "installed: http://$host"

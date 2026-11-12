@@ -847,15 +847,60 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS
 
 
+def wanted_backend():
+    target = teamlib.anchor_backend() if teamlib.dashboard_host() else None
+    return target if target and target != teamlib.PORT else None
+
+
+def backend_watch(stop, interval=1.0, retry=5.0):
+    current, srv, failed, error, next_try = None, None, None, None, 0.0
+
+    def note(msg):
+        nonlocal error
+        if msg != error:
+            sys.stderr.write(msg + "\n")
+            error = msg
+    while not stop.is_set():
+        try:
+            want = wanted_backend()
+            if srv and want != current:
+                srv.shutdown()
+                srv.server_close()
+                sys.stderr.write(f"backend listener on 127.0.0.1:{current} closed\n")
+                srv, current = None, None
+            if want and not srv and (want != failed or time.monotonic() >= next_try):
+                try:
+                    srv = ThreadingHTTPServer(("127.0.0.1", want), Handler)
+                except Exception as e:
+                    srv, failed, next_try = None, want, time.monotonic() + retry
+                    note(f"cannot open the backend listener on 127.0.0.1:{want}: {e}; serving 127.0.0.1:{teamlib.PORT} only, retrying every {retry:g} s")
+                else:
+                    srv.daemon_threads = True
+                    threading.Thread(target=srv.serve_forever, daemon=True).start()
+                    current, failed, error = want, None, None
+                    sys.stderr.write(f"backend listener for the local domain on 127.0.0.1:{want}\n")
+            if not want:
+                failed, error = None, None
+        except Exception as e:
+            note(f"backend watcher error: {e!r}")
+        stop.wait(interval)
+    if srv:
+        srv.shutdown()
+        srv.server_close()
+
+
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", teamlib.PORT), Handler)
     srv.daemon_threads = True
     sys.stderr.write(f"team dashboard on http://127.0.0.1:{teamlib.PORT}/ db={teamlib.DB}\n")
+    stop = threading.Event()
+    threading.Thread(target=backend_watch, args=(stop,), daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         srv.server_close()
 
 

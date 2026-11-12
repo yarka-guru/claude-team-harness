@@ -402,7 +402,8 @@ def git_info(path):
         d = d.parent
 
 
-def port_open(port=PORT):
+def port_open(port=None):
+    port = port or PORT
     s = socket.socket()
     s.settimeout(0.2)
     try:
@@ -411,14 +412,32 @@ def port_open(port=PORT):
         s.close()
 
 
-def dashboard_host():
+def anchor_owner():
     try:
         rule = (ETC / "pf.anchors" / "claude-team").read_text(errors="replace")
-        lines = (ETC / "hosts").read_text(errors="replace").splitlines()
     except OSError:
         return None
-    m = re.search(r"\bport 80 -> 127\.0\.0\.1 port (\d+)\b", rule)
-    if not m or int(m.group(1)) != PORT:
+    m = re.search(r"\bport 80 -> 127\.0\.0\.1 port (\d{1,5})\b", rule)
+    if not m or not 0 < int(m.group(1)) < 65536:
+        return None
+    target = int(m.group(1))
+    own = re.search(r"^# claude-team port=(\d{1,5}) backend=(\d{1,5})[ \t]*$", rule, re.M)
+    if not own:
+        return target, target
+    return (int(own.group(1)), target) if int(own.group(2)) == target else None
+
+
+def anchor_backend():
+    owner = anchor_owner()
+    return owner[1] if owner and owner[0] == PORT else None
+
+
+def dashboard_host():
+    if anchor_backend() is None:
+        return None
+    try:
+        lines = (ETC / "hosts").read_text(errors="replace").splitlines()
+    except OSError:
         return None
     for line in lines:
         parts = line.split()
@@ -432,16 +451,57 @@ def dashboard_url():
     return f"http://{host}" if host else f"http://127.0.0.1:{PORT}"
 
 
+def own_server(pid):
+    try:
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return False
+    return re.search(r"(^|\s)" + re.escape(str(ROOT / "dashboard" / "server.py")) + r"(\s|$)", cmd.strip()) is not None
+
+
+def listeners(port):
+    try:
+        out = subprocess.run(["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return []
+    return sorted({int(p) for p in out.split() if p.isdigit()})
+
+
+def pidfile_server():
+    try:
+        pid = int((STATE / "dashboard.pid").read_text().strip())
+        os.kill(pid, 0)
+    except Exception:
+        return None
+    return pid if own_server(pid) else None
+
+
+def server_pids():
+    ports = {PORT, anchor_backend() or PORT}
+    pids = {p for port in ports for p in listeners(port) if own_server(p)}
+    pid = pidfile_server()
+    return sorted(pids | ({pid} if pid else set()))
+
+
+def server_alive():
+    return pidfile_server() is not None or any(own_server(p) for p in listeners(PORT))
+
+
 def ensure_dashboard():
-    if port_open():
+    if port_open() or server_alive():
         return False
     server = ROOT / "dashboard" / "server.py"
     if not server.exists():
         return False
     STATE.mkdir(parents=True, exist_ok=True)
-    log = open(STATE / "dashboard.log", "a")
-    p = subprocess.Popen([sys.executable, str(server)], stdout=log, stderr=log,
-                         stdin=subprocess.DEVNULL, start_new_session=True, cwd=str(ROOT))
+    with open(STATE / "dashboard.log", "a") as log:
+        p = subprocess.Popen([sys.executable, str(server)], stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, start_new_session=True, cwd=str(ROOT))
+    try:
+        p.wait(timeout=0.8)
+        return False
+    except subprocess.TimeoutExpired:
+        pass
     (STATE / "dashboard.pid").write_text(str(p.pid))
     return True
 

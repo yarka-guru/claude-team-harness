@@ -7,6 +7,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.request
 import webbrowser
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -172,16 +173,32 @@ def cmd_release(con, args):
     print(f"released {n}")
 
 
+def domain_answers(url):
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(urllib.request.Request(url, method="HEAD"), timeout=1.5) as r:
+            return str(r.headers.get("Server") or "").startswith("team-dashboard")
+    except Exception:
+        return False
+
+
+def dashboard_state():
+    direct = T.port_open()
+    host = T.dashboard_host()
+    domain = bool(host) and domain_answers(f"http://{host}/")
+    parts = [f"direct http://127.0.0.1:{T.PORT}/ {'answers' if direct else 'does not answer'}"]
+    if host:
+        parts.append(f"domain http://{host}/ {'answers' if domain else 'does not answer'}")
+    return direct or domain, "; ".join(parts)
+
+
 def cmd_dashboard(con, args):
     url = T.dashboard_url() + "/"
     pidf = T.STATE / "dashboard.pid"
     if args.action == "stop":
-        pids = subprocess.run(["lsof", "-t", f"-iTCP:{T.PORT}", "-sTCP:LISTEN"], capture_output=True, text=True).stdout.split()
-        for pid in pids:
-            out = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True).stdout
-            if "dashboard/server.py" in out:
-                os.kill(int(pid), signal.SIGTERM)
-                print(f"stopped {pid}")
+        for pid in T.server_pids():
+            os.kill(pid, signal.SIGTERM)
+            print(f"stopped {pid}")
         pidf.unlink(missing_ok=True)
         return
     if args.action in ("start", "open"):
@@ -190,11 +207,21 @@ def cmd_dashboard(con, args):
             if T.port_open():
                 break
             time.sleep(0.1)
+        held = T.listeners(T.PORT)
+        foreign = [p for p in held if not T.own_server(p)]
+        if foreign and len(foreign) == len(held):
+            cmd = subprocess.run(["ps", "-p", str(foreign[0]), "-o", "command="], capture_output=True, text=True).stdout.strip()
+            sys.exit(f"failed: 127.0.0.1:{T.PORT} is held by another program (pid {foreign[0]}: {cmd}); stop it or set TEAM_PORT")
+        if not T.port_open():
+            if T.server_alive():
+                sys.exit(f"failed: a dashboard process of this workspace runs but 127.0.0.1:{T.PORT} does not answer; see {T.STATE / 'dashboard.log'}")
+            sys.exit(f"failed: the dashboard did not start; see {T.STATE / 'dashboard.log'}")
         print(("started " if started else "running ") + url)
         if args.action == "open":
             webbrowser.open(url)
         return
-    print(("up " if T.port_open() else "down ") + url)
+    up, detail = dashboard_state()
+    print(("up: " if up else "down: ") + detail)
 
 
 def cmd_ritual(con, args):
