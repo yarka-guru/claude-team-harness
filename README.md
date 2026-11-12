@@ -204,3 +204,7 @@ export TEAM_DB=/tmp/team-demo/team.db TEAM_RITUALS=/tmp/team-demo/rituals TEAM_P
 python3 .claude/team/dashboard/seed_demo.py
 python3 .claude/team/dashboard/server.py      # http://127.0.0.1:7778
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
