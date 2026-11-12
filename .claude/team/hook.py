@@ -681,16 +681,28 @@ def rituals_due():
 
 
 HANDBACK = re.compile(r'^\s*<agent-message from="([^"]+)">\s*\[Subagent hand-back\][^\n]*\n(.*?)(\n</agent-message>\s*$|$)', re.S)
-ASK_HEAD = re.compile(r"^\W*(що від тебе|твій крок|що лишилось тобі)\b", re.I)
-STRICT_HEAD = re.compile(r"^ {0,3}(?:#{1,6}\s+)?(?:\d{1,2}[.)]\s+|[-*•]\s+)?[*_]{0,3}\s*(what i need from you|your steps?|від тебе|на тобі)(?P<tail>.*)$", re.I)
+ASK_HEAD = re.compile(r"^\W*(що від тебе|на тобі|від тебе|твій крок|що лишилось тобі)\b", re.I)
+NEGATED = re.compile(r"нічого|не потрібно|не треба|не висить", re.I)
+EN_HEAD = re.compile(r"^ {0,3}(?:#{1,6}\s+)?(?:\d{1,2}[.)]\s+|[-*•]\s+)?[*_]{0,3}\s*(what i need from you|your steps?)(?!\w)(?P<tail>.*)$", re.I)
 HEAD_SUFFIX = re.compile(r"[*_]*\s*(?:\([^)]{1,24}\)|(?:now|today|later|зараз|сьогодні|потім)(?!\w))?", re.I)
-NEG = re.compile(r"(?:(?:зараз|поки(?:\s+що)?|наразі|від\s+тебе)\s+)?(?:нічого|не\s+треба|не\s+потрібно)(?!\w)|"
-                 r"(?:nothing|none|not\s+needed|no\s+action(?:\s+(?:needed|required))?)(?!\w)", re.I)
+NOWQ = r"(?:зараз|наразі|поки(?:\s+що)?|right\s+now|for\s+now|at\s+the\s+moment|now)"
+NEGW = r"(?:нічого|не\s+треба|не\s+потрібно|nothing|none|not\s+needed|no\s+action(?:\s+(?:needed|required))?)"
+NEG = re.compile(r"(?:(?:зараз|поки(?:\s+що)?|наразі|від\s+тебе)\s+)?" + NEGW + r"(?!\w)", re.I)
+NOW_NEG = re.compile(r"^\W*(?:" + NOWQ + r"\W+" + NEGW + r"|" + NEGW + r"\s+" + NOWQ + r")(?!\w)", re.I)
 NEG_BREAK = re.compile(r"`!\s?\S|\?|(?<!\w)(?:but|except|just|але|крім|тільки)(?!\w)", re.I)
+LEADS = (r"(?:пізніше|згодом|потім|після|коли|як|якщо|завтра|ввечері|зранку|у\s+(?:понеділок|вівторок|середу|четвер|п['’ʼ]?ятницю)|"
+         r"later|after|once|when|if|tomorrow)")
+LATER_CLAUSE = re.compile(r"[,;.]\s*(?:а\s+|and\s+)?" + LEADS + r"(?!\w)[^—–:?]{0,80}?\s*(?:—|–|\s-\s|:)\s*(?P<rest>\S.*)$|"
+                          r"[,;.]\s*(?:once|when|after)\s[^,—–:]{1,80},\s*(?P<rest2>\S.*)$", re.I)
+ASKY = re.compile(r"\?|`!\s|^!\s|^(?:продуктове|product)\b|^" + LEADS + r"(?!\w)\W*\w+", re.I)
+HEAD_FORM = re.compile(r"^\W*(?:що від тебе|на тобі|від тебе|твій крок|що лишилось тобі)[*_\s]*(?::|$)", re.I)
 BULLET = re.compile(r"^\s*(?:(?:[-*•—–]|\d{1,2}[.)])(?:\s+|$))+")
 SECTION = re.compile(r"рішення|ідеї|перевір|результат|що є|рев'ю|ризики|далі|\bdecisions?\b|\bideas\b|\bcheck|\bresults?\b|\breview\b|\brisks\b|\bnext\b", re.I)
 SUBHEAD = re.compile(r"^\s{0,3}(#{1,6}\s+.*|\*\*[^*]+\*\*\s*:?|__[^_]+__\s*:?)\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+GROUP = re.compile(r"^[*_\s]*(?P<label>зараз|пізніше|потім|згодом|now|later)[*_]*\s*(?:(?:[:—–]|\s-\s)[*_\s]*(?P<rest>.*))?$", re.I)
+LATER = re.compile(r"пізніше|потім|згодом|later", re.I)
+SHORT_LABEL = re.compile(r"^[*_\s]*(?:\S+\s+){0,3}\S+?[*_]*:[*_\s]*$")
 USER_NOTIFY = {"permission_prompt", "elicitation_dialog"}
 
 
@@ -750,22 +762,34 @@ def prompt_submit(con, inp):
     return ctx("UserPromptSubmit", box) if box else None
 
 
-def heading_rest(line):
+def en_heading(line):
+    m = EN_HEAD.match(line)
+    if not m:
+        return None
+    t = m.group("tail")
+    t = t[HEAD_SUFFIX.match(t).end():].lstrip(" *_")
+    if not t or (t[0] == "." and not t[1:].strip(" *_")):
+        return ""
+    if t[0] in "—–" or (t[0] == "-" and t[1:2] in ("", " ")):
+        return t[1:].strip(" *_")
+    colon = re.search(r"(?<!\d):(?=\s|\*|_|$)", re.sub(r"`[^`]*`", lambda m: "x" * len(m.group(0)), t))
+    if not colon:
+        return None
+    before = t[:colon.start()].strip(" *_")
+    if before and (len(before.split()) > 3 or re.match(r"(?:is|are|was|were)\b", before, re.I) or NEG.search(before)):
+        return None
+    return t[colon.end():].strip(" *_")
+
+
+def heading(line):
     if re.match(r"^(?: {4}|\t)|^\s*>", line):
         return None
-    m = STRICT_HEAD.match(line)
-    if m:
-        t = m.group("tail")
-        t = t[HEAD_SUFFIX.match(t).end():].lstrip(" *_")
-        if not t:
-            return ""
-        if t[0] in ":—–" or (t[0] == "-" and t[1:2] in ("", " ")):
-            return t[1:].strip(" *_")
-        if t[0] == "." and not t[1:].strip(" *_"):
-            return ""
-        return None
+    rest = en_heading(line)
+    if rest is not None:
+        return rest, False
     if ASK_HEAD.match(line):
-        return re.sub(r"^\W*\w[\w\s]*?\b(тебе|тобі|крок)\b\W*", "", line, flags=re.I).strip(" *:")
+        rest = re.sub(r"^\W*\w[\w\s]*?\b(тебе|тобі|крок)\b\W*", "", line, flags=re.I).strip(" *:")
+        return rest, not HEAD_FORM.match(line) and bool(NEGATED.search(line))
     return None
 
 
@@ -787,12 +811,44 @@ def fence_end(lines, j, mark):
     return k
 
 
-def ask_block(lines, i, inline):
+def answer(text, items):
+    text = text.strip(" *_")
+    if not text:
+        return "open"
+    g = GROUP.match(text)
+    if g:
+        rest = (g.group("rest") or "").strip(" *_")
+        later = bool(LATER.fullmatch(g.group("label")))
+        if rest and not negated(rest):
+            items.append(rest)
+            return "open"
+        if later:
+            return "open"
+        return "wait" if rest else "open"
+    if NOW_NEG.match(text):
+        clause = LATER_CLAUSE.search(text)
+        later = clause and (clause.group("rest") or clause.group("rest2"))
+        if later and not negated(later):
+            items.append(later)
+            return "open"
+        return "wait"
+    if negated(text):
+        return "stop"
+    items.append(text)
+    return "open"
+
+
+def ask_block(lines, i, rest, line_negated):
     block, items = [lines[i]], []
-    if inline is not None and inline.strip():
-        if negated(inline):
-            return None
-        items.append(inline)
+    state = "open"
+    if rest:
+        state = answer(rest, items)
+    elif line_negated:
+        state = "stop"
+    if line_negated and state == "open" and items and not (NOW_NEG.match(rest) or GROUP.match(rest)):
+        return None
+    if state == "stop":
+        return None
     j, seen_list, blank = i + 1, False, False
     while j < len(lines) and j < i + 40:
         nxt = lines[j]
@@ -802,22 +858,58 @@ def ask_block(lines, i, inline):
             block += lines[j:k + 1]
             items += [c for c in lines[j + 1:k] if c.strip()]
             j, blank = k + 1, False
+            state = "open" if state == "wait" else state
             continue
         if not nxt.strip():
             blank = True
             j += 1
             continue
         if SUBHEAD.match(nxt):
-            if SECTION.search(nxt):
+            if SECTION.search(nxt) and not GROUP.match(nxt):
                 break
+            label = GROUP.match(nxt)
+            if label and LATER.fullmatch(label.group("label")) or SHORT_LABEL.match(nxt):
+                state = "open"
             block.append(nxt)
             j += 1
             continue
+        text = BULLET.sub("", nxt).strip()
         is_list = bool(BULLET.match(nxt)) or nxt.startswith(("  ", "\t")) and seen_list
+        g = GROUP.match(text)
+        if state == "wait" and g and not LATER.fullmatch(g.group("label")):
+            j += 1
+            continue
+        if g or (state == "wait" and SHORT_LABEL.match(text)):
+            if g:
+                before = len(items)
+                result = answer(text, items)
+                if result == "wait" and not items and not is_list:
+                    state = "wait"
+                elif LATER.fullmatch(g.group("label")) or len(items) > before:
+                    state = "open"
+            else:
+                state = "open"
+            block.append(nxt)
+            seen_list, blank = seen_list or is_list, False
+            j += 1
+            continue
+        if state == "wait":
+            if is_list or ASKY.search(text):
+                block.append(nxt)
+                items.append(nxt)
+                seen_list = seen_list or is_list
+            j += 1
+            continue
         if not is_list and (seen_list or (blank and items)):
             break
-        if not is_list and not items and negated(nxt):
-            return None
+        if not is_list and not items:
+            result = answer(text, items)
+            if result == "stop":
+                return None
+            block.append(nxt)
+            state, blank = result, False
+            j += 1
+            continue
         block.append(nxt)
         items.append(nxt)
         seen_list = seen_list or bool(BULLET.match(nxt))
@@ -840,10 +932,10 @@ def user_asks(text):
         if fm:
             fence = fm.group(1)
             continue
-        inline = heading_rest(line)
-        if inline is None:
+        head = heading(line)
+        if head is None:
             continue
-        got = ask_block(lines, i, inline)
+        got = ask_block(lines, i, *head)
         if got:
             return got
     return None

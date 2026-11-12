@@ -18,8 +18,8 @@ import hook
 SESSION = "sess-lang-test"
 
 
-def board(lang, db):
-    env = dict(os.environ, TEAM_DB=str(db))
+def board(lang, db, config=None):
+    env = dict(os.environ, TEAM_DB=str(db), TEAM_CONFIG=str(config or Path(db).parent / "no-config.json"))
     env.pop("TEAM_LANG", None)
     if lang:
         env["TEAM_LANG"] = lang
@@ -54,6 +54,30 @@ class BoardLangTest(unittest.TestCase):
         out = run("board")
         for heading in ("== Чекає на тебе (1)", "== До роботи (1)", "== На прийомці (1)"):
             self.assertIn(heading, out)
+
+    def test_config_file_and_env_override(self):
+        config = Path(self.tmp.name) / "config.json"
+        config.write_text('{"lang": "uk"}')
+        run = board(None, self.db, config)
+        self.fill(run)
+        self.assertIn("== До роботи (1)", run("board"))
+        self.assertIn("== To do (1)", board("en", self.db, config)("board"))
+        config.write_text("not json")
+        self.assertIn("== To do (1)", board(None, self.db, config)("board"))
+
+    def test_config_file_edge_cases(self):
+        config = Path(self.tmp.name) / "config.json"
+        env = dict(os.environ, TEAM_CONFIG=str(config))
+        env.pop("TEAM_LANG", None)
+        code = "import teamlib; print(teamlib.LANG)"
+        lang = lambda: subprocess.run([sys.executable, "-B", "-c", code], cwd=ROOT, capture_output=True, text=True, env=env, timeout=10).stdout.strip()
+        for text, want in [("\ufeff{\"lang\": \" UK \"}", "uk"), ('{"lang": "ua"}', "uk"), ('{"lang": "uk-UA"}', "uk"), ('{"lang": ["uk"]}', "en"),
+                           ('["uk"]', "en"), ("[" * 5000 + "]" * 5000, "en"), ('{"lang": "uk", "pad": "' + "x" * 5000 + '"}', "en")]:
+            config.write_text(text, encoding="utf-8")
+            self.assertEqual(lang(), want, text[:40])
+        config.unlink()
+        os.mkfifo(config)
+        self.assertEqual(lang(), "en")
 
     def test_unknown_lang_falls_back_to_english(self):
         run = board("de", self.db)
@@ -121,11 +145,70 @@ class AskHeadingTest(unittest.TestCase):
         self.assertNotIn("migration", got)
 
     def test_ukrainian_heading_forms(self):
-        for text in ["Від тебе я отримав апрув учора, тому змерджив.", "Від тебе залежить лише вибір назви.", "На тобі було два PR, обидва змерджені.",
-                     "На тобі нічого не висить, усе змерджено.\n\nЗвіт: 3 картки закрито."]:
+        for text in ["Від тебе потрібен апрув PR #47.", "На тобі лишився мердж PR #47 і терраформ apply.", "Від тебе чекаю рішення: 20 MB чи 8 MB?"]:
+            self.assertTrue(hook.user_asks(text), text)
+        for text in ["На тобі нічого не висить, усе змерджено.\n\nЗвіт: 3 картки закрито.", "Від тебе більше нічого не треба: я все змерджив.",
+                     "Від тебе вже нічого не потрібно: PR змерджено.", "Від тебе: —", "На тобі: нічого.", "На тобішньому боці все ок: нічого не міняв."]:
             self.assertIsNone(hook.user_asks(text), text)
         for text in ["**Від тебе**\n- апрув PR #47", "На тобі: відповісти про ліміт", "### На тобі\n- вибрати назву", "Твій крок: апрув",
                      "Що лишилось тобі: змерджити PR"]:
+            self.assertTrue(hook.user_asks(text), text)
+
+    def test_now_and_later_groups(self):
+        for text in ["**Що від тебе**\n\nЗараз нічого.\n\nПізніше:\n- вибрати назву для бакета\n- відповісти про ліміт",
+                     "**Що від тебе**\n\nЗараз нічого — чекай на звіт.\n\nПізніше — без змін: ключі для ротації, дата релізу.",
+                     "**What I need from you**\nNothing right now.\n\nLater:\n- rotate the staging keys",
+                     "**What I need from you:** nothing for now.\n\nLater: pick the bucket name."]:
+            self.assertTrue(hook.user_asks(text), text)
+        for text in ["**Що від тебе:** зараз нічого.\n\nДалі запущу тести і відзвітую.",
+                     "**Що від тебе**\n\nЗараз нічого.\n\nПізніше: нічого.",
+                     "**What I need from you**\nNothing right now.\n\nI will report after lunch."]:
+            self.assertIsNone(hook.user_asks(text), text)
+
+    def test_waiting_reopens_only_on_a_later_label(self):
+        for text in ["**Що від тебе**\nЗараз нічого.\nДалі запущу тести.", "**Що від тебе**\nЗараз нічого.\n\nДалі запущу тести.",
+                     "**What I need from you:** nothing.\n\nNext I will run the tests.", "**What I need from you**\nNothing right now.\n\nI will merge it myself.", "**Що від тебе**\nЗараз — нічого.\n\nЗвіт: 3 картки закрито.",
+                     "**Що від тебе**\nПоки нічого.\n\nЗараз — чекаю CI, потім відзвітую.", "**What I need from you:** nothing now.\nI will ping you when CI is green.",
+                     "**What I need from you**\nNothing — everything is merged now.\n\nLater: I will clean up the branch.",
+                     "**Що від тебе**\nНаразі нічого.\n\n**Рішення**\n- лишив старий API — менше змін"]:
+            self.assertIsNone(hook.user_asks(text), text)
+        for text in ["**Що від тебе:** зараз нічого\n**Пізніше**\n- апрув PR #47", "**Що від тебе**\nЗараз нічого.\n\nПісля релізу:\n- підтвердити ліміт",
+                     "**Що від тебе**\nЗараз нічого.\n\nДалі запущу тести.\n\nПізніше:\n- апрув", "**Що від тебе**\nЗараз нічого.\n\nЗгодом — рішення про ліміт.",
+                     "**Що від тебе:** зараз нічого, пізніше — апрув PR #47.", "**Що від тебе**\nНічого зараз не треба, відпочивай.\n\nПізніше — апрув релізу 2.4.0.",
+                     "**Що від тебе**\n- наразі нічого\n- (опційно) глянь звіт"]:
+            self.assertTrue(hook.user_asks(text), text)
+
+    def test_asks_after_a_now_negation(self):
+        for text in ["**Що від тебе**\nЗараз нічого.\n- Завтра — апрув PR #47",
+                     "**Що від тебе**\nЗараз нічого, чекаю CI.\n- Після CI: змерджи #47 і запусти apply.",
+                     "**Що від тебе**\nЗараз нічого.\nКоли CI позеленіє — змерджи #47 і запусти apply.",
+                     "**Що від тебе**\nЗараз нічого.\n\nПродуктове: чи робимо ротацію цього тижня?",
+                     "**Що від тебе**\nЗараз нічого.\n- Продуктове: чи робимо ротацію цього тижня?",
+                     "**Що від тебе**\nЗараз нічого.\n- `! gcloud auth login`, коли будеш за ноутом.",
+                     "**Що від тебе**\nЗараз нічого.\nЯк закінчиться копія — апрув #52.",
+                     "**What I need from you**\nNothing right now.\n- Tomorrow: approve PR #47",
+                     "**What I need from you**\nNothing now.\n\nProduct question: ship on Friday or Monday?",
+                     "**Що від тебе:** зараз нічого.\n- PR #47 вже змерджено", "**Що від тебе**\nЗараз нічого.\n```\n! make deploy\n```",
+                     "**Що від тебе**\nЗараз нічого. Після апруву на #52 — змерджи #47.", "**What I need from you**\nNothing now; once CI is green, approve PR #47.",
+                     "**Що від тебе:** перевір, що нічого не зламалось"]:
+            self.assertTrue(hook.user_asks(text), text)
+
+    def test_labelled_lines(self):
+        for text in ["**Що від тебе**\n- Зараз: нічого\n- Пізніше: нічого", "**Що від тебе**\nЗараз: нічого.\nПізніше: нічого.",
+                     "**Що від тебе зараз**\n- нічого", "**Що від тебе**\n\n**Зараз**\n- нічого\n\n**Пізніше**\n- нічого"]:
+            self.assertIsNone(hook.user_asks(text), text)
+        for text in ["**Що від тебе**\n- Зараз: нічого\n- Пізніше: апрув PR #47", "**Що від тебе**\nЗараз: апрув PR #47.\nПізніше: нічого.",
+                     "**What I need from you**\nNow: nothing.\nLater: approve PR #47.", "**Що від тебе**\n- Запусти apply:"]:
+            self.assertTrue(hook.user_asks(text), text)
+
+    def test_sentence_heading_ending_with_colon(self):
+        self.assertTrue(hook.user_asks("Від тебе по PROJ-34 потрібно ось що:\n- переглянути чернетку\n- підтвердити бакет"))
+        self.assertTrue(hook.user_asks("What I need from you before the release:\n- approve the plan"))
+        for text in ["What I need from you is simple: a review.", "What I need from you is nothing: everything is merged.",
+                     "What I need from you is in the ticket https://example.com/browse/PROJ-3", "What I need from you at 10:30 is a review.",
+                     "What I need from you after the `fix: typo` commit is a review."]:
+            self.assertIsNone(hook.user_asks(text), text)
+        for text in ["What I need from you: a review", "What I need from you today: approve PR #47"]:
             self.assertTrue(hook.user_asks(text), text)
 
     def test_fences_quotes_and_indented_code(self):

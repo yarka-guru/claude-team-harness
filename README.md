@@ -104,7 +104,8 @@ Paths are derived from the files' own location. Environment overrides:
 | `TEAM_WORKSPACE` | two levels above `.claude/team` | workspace root, used to find this workspace's transcripts in `~/.claude/projects/<slug>` |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config dir |
 | `TEAM_AS` | `lead` | default `--as` for the CLI |
-| `TEAM_LANG` | `en` | `uk` for Ukrainian CLI board headings and hook event texts |
+| `TEAM_LANG` | `en` | `uk` for Ukrainian CLI board headings and hook event texts; without it the value comes from `.claude/team/config.json` (`{"lang": "uk"}`), which also reaches the CLI run from a plain terminal |
+| `TEAM_CONFIG` | `.claude/team/config.json` | path of that config file |
 
 The project slug is the workspace's absolute path with every non-alphanumeric character replaced
 by `-`, as Claude Code names its project directories.

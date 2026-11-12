@@ -24,7 +24,23 @@ CLI_DOC = "python3 .claude/team/team.py"
 PORT = int(os.environ.get("TEAM_PORT") or 7777)
 ETC = Path(os.environ.get("TEAM_ETC") or "/etc")
 DOMAIN_MARK = " # claude-team"
-LANG = "uk" if (os.environ.get("TEAM_LANG") or "").lower().startswith("uk") else "en"
+
+
+def configured_lang():
+    lang = os.environ.get("TEAM_LANG")
+    if not lang:
+        try:
+            path = Path(os.environ.get("TEAM_CONFIG") or ROOT / "config.json")
+            if path.is_file() and path.stat().st_size <= 4096:
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+                lang = data.get("lang") if isinstance(data, dict) else None
+        except Exception:
+            lang = None
+    lang = str(lang or "").strip().lower() if isinstance(lang, (str, type(None))) else ""
+    return "uk" if lang.startswith("uk") or lang == "ua" else "en"
+
+
+LANG = configured_lang()
 TEXT = {
     "guard.fact": ("fact-check: blocked {what} — {reason}", "фактчек: заблоковано {what} — {reason}"),
     "guard.fact_error": ("fact-check: error in {fn}, the call went through unchecked", "фактчек: помилка в {fn}, виклик пропущено без перевірки"),
