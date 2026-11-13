@@ -13,33 +13,84 @@ recognises the Ukrainian heading "Що від тебе"; see `CLAUDE.example.md`
 
 ## Install with an agent
 
-Start your coding agent (Claude Code or a similar CLI agent) in the workspace you want to equip and give it this prompt. Replace the path with where you cloned this repository.
+Start your coding agent (Claude Code or a similar CLI agent) in the workspace you want to equip and give it this prompt. Replace the path with where you cloned this repository. The steps are the ones in "Install" below, each with a check.
 
 ```
-Install the Claude team harness, cloned at <path to this clone>, into the workspace in the current directory. Follow the checklist in the "Install with an agent" section of its README.md. Run every step and its check, and show me the output. Do not use sudo, do not touch ~/.claude, and do not run schedule/install.sh or install-domain.sh. Stop and ask before overwriting any existing file. At the end, list what you changed and what is left for me.
+Install the Claude team harness, cloned at <path to this clone>, into the workspace in the current directory. Follow the "Install with an agent" section of its README.md: run every step and its check, and show me the output. Stop and ask before overwriting or modifying any existing file, and before running any launchd or sudo script. Do not touch ~/.claude. At the end, list what you changed and what is left for me.
 ```
 
-Checklist. `H` is the clone, the current directory is the workspace root, and the workspace may be empty.
+Run from the workspace root. Shell state may not carry over between commands, so begin each command that uses `$H` with `H=<path to the clone>`. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
 
-1. Prerequisites. `python3 --version` prints 3.9 or newer. `claude --version` prints a version. `git` is needed only for step 4. `lsof` is needed only for `dashboard stop`.
-2. Copy without overwriting: `mkdir -p .claude && cp -Rn "$H/.claude/." .claude/`. Check: `diff -rq "$H/.claude" .claude` prints no `differ` line. If it does, a file of yours was kept; merge it by hand.
-3. Settings. With no `.claude/settings.json`, run `cp .claude/settings.example.json .claude/settings.json`. With one, add the `env` key and append each event's entry to your existing array for that event; never replace the file. Check: `python3 -c "import json;print(*sorted(json.load(open('.claude/settings.json'))['hooks']))"` prints `Notification PreToolUse SessionEnd SessionStart Stop SubagentStart SubagentStop UserPromptSubmit`.
-4. Lead instructions: append `$H/CLAUDE.example.md` to `CLAUDE.md` (create it if missing), unless it already has a `# Team lead mode` heading. Keep the English defaults; the model table and reporting language are for the human to tune. Check: `grep -c '^# Team lead mode' CLAUDE.md` prints `1`.
-5. Ignore rules, if the workspace is a git repo: append `.claude/team/state/`, `.claude/team/rituals/` and `.claude/backup/` to `.gitignore`. The event log stores prompts and drafts. Check: `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths.
-6. Hook smoke test, no restart needed: `echo '{"session_id":"t","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py`. Check: the JSON output contains `Team harness on. Dashboard: http://127.0.0.1:7777`. It creates `.claude/team/state/team.db` and starts the dashboard. If port 7777 is taken, put `"TEAM_PORT": "7790"` in the settings `env` and export it for this shell.
-7. Event log and board: `python3 .claude/team/team.py feed --all` prints a line ending `lead session: startup`. `python3 .claude/team/team.py task add "smoke test" --owner lead` then `python3 .claude/team/team.py board` shows `T-1` under `To do`; remove it with `task drop T-1`, which prints `ok`.
-8. Dashboard: `python3 .claude/team/team.py dashboard status` prints `up: direct http://127.0.0.1:7777/ answers`. `dashboard open` opens it in the browser.
-9. Gate: `echo 'Fixed in v1.2.3' > /tmp/n.md; echo '{"session_id":"t","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr comment 5 --body-file /tmp/n.md"}}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py` prints a `permissionDecision` of `deny` that names the version.
-10. Optional: `cd .claude/team && TEAM_DB=$(mktemp -d)/team.db python3 -m unittest discover -s tests` ends with `OK`. It takes about a minute.
+1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version. `git` is needed for step 3 in a git repo, `lsof` for `dashboard stop`. Snapshot for the rollback check: `cp -R . "../$(basename "$PWD").before"`.
+2. Copy without overwriting: `mkdir -p .claude && cp -Rn "$H/.claude/." .claude/`. Check: `diff -rq "$H/.claude" .claude` prints no `differ` line (`Only in .claude` lines are your own files). A `differ` line is a file of yours that was kept; merge by hand.
+3. Wire settings, `CLAUDE.md` and `.gitignore`. It is safe to run twice. An existing `settings.json` is rewritten with 2-space indentation, content kept.
+```
+H=<path to the clone> python3 - <<'EOF'
+import json,os
+H=os.environ['H']
+GI='.claude/team/state/\n.claude/team/rituals/\n.claude/backup/\n'
+def add(p,block,mark):
+    t=open(p).read() if os.path.exists(p) else ''
+    if mark not in t: open(p,'a').write(('\n' if t else '')+block)
+ex=json.load(open('.claude/settings.example.json'))
+p='.claude/settings.json'; cur=json.load(open(p)) if os.path.exists(p) else {}
+before=json.dumps(cur); had=set(cur.get('env',{}))
+for k,v in ex['env'].items(): cur.setdefault('env',{}).setdefault(k,v)
+for ev,es in ex['hooks'].items():
+    a=cur.setdefault('hooks',{}).setdefault(ev,[])
+    if not any('team/hook.py' in h.get('command','') for e in a for h in e.get('hooks',[])): a+=es
+if json.dumps(cur)!=before: json.dump(cur,open(p,'w'),indent=2)
+print('added env:',[k for k in cur['env'] if k not in had])
+add('CLAUDE.md',open(H+'/CLAUDE.example.md').read(),'# Team lead mode')
+if os.path.isdir('.git'): add('.gitignore',GI,'.claude/team/state/')
+EOF
+```
+   Checks: `grep -c team/hook.py .claude/settings.json` prints `8`; `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git repo `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths.
+4. Hook smoke test, no restart needed: `echo '{"session_id":"t","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py`. Check: the JSON contains `Team harness on. Dashboard: http://127.0.0.1:7777`. It creates `.claude/team/state/team.db` and starts the dashboard. If port 7777 is taken, export `TEAM_PORT` and add it to the settings `env`.
+5. Log and board: `python3 .claude/team/team.py feed --all` prints a line ending `lead session: startup`. `python3 .claude/team/team.py task add "smoke test" --owner lead` then `python3 .claude/team/team.py board` shows `T-1` under `To do`; `task drop T-1` prints `ok`.
+6. Dashboard: `python3 .claude/team/team.py dashboard status` prints `up: direct http://127.0.0.1:7777/ answers`.
+7. Gate: `n=$(mktemp) && echo 'Fixed in v1.2.3' > "$n" && printf '{"session_id":"t","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr comment 5 --body-file %s"}}' "$n" | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py; rm "$n"` prints a `permissionDecision` of `deny` that names the version.
+8. Optional, about a minute: `cd .claude/team && TEAM_DB=$(mktemp -d)/team.db python3 -m unittest discover -s tests` ends with `OK`.
 
 Steps that stay with the human:
 
-- Hooks load only when a session starts. The human starts a new `claude` in the workspace and approves any trust prompt. Check afterwards: `team.py who` lists a running `lead`, and `team.py feed --all` has a new `lead session: startup` line.
-- Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`, each capped at $3 to $6 of API spend per run. The human decides whether to spend that. Check: `launchctl list | grep com.claude-team` lists four labels. Needs `claude --help` to show `--effort`, `--permission-mode` and `--max-budget-usd`.
+- Hooks load only when a session starts. The human starts a new `claude` in the workspace and approves any trust prompt. Then `team.py who` lists a running `lead` and `team.py feed --all` has a new `lead session: startup` line.
+- Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`. Caps per run: daily $3, planning $5, retro $6, reflect $6. Daily and reflect run on 5 weekdays, planning and retro once a week, so the worst case is 5x3 + 5 + 6 + 5x6 = $56 a week. The labels `com.claude-team.*` are per user, not per workspace: installing from a second workspace replaces the first one's jobs, and `uninstall.sh` removes them. Check: `launchctl list | grep com.claude-team` lists four labels. `claude --help` must show `--effort`, `--permission-mode` and `--max-budget-usd`.
 - Local domain: `sudo .claude/team/schedule/install-domain.sh` edits `/etc/hosts`, `pf` and a LaunchDaemon. See "Local domain".
-- Accounts: the Codex CLI, `gh`, and the Slack and Jira connectors belong to the human. Roles in `.claude/agents/` name some tools; `researcher.md` lists example MCP tool ids to replace.
+- Accounts: the Codex CLI, `gh` and the Slack and Jira connectors are the human's; replace the example MCP tool ids in `researcher.md`.
 
-Roll back: run `python3 .claude/team/team.py dashboard stop`, `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` if they were installed. Remove the hook entries and the `env` key from `.claude/settings.json`, the `# Team lead mode` text from `CLAUDE.md` and the three `.gitignore` lines. Delete `.claude/team`, `.claude/knowledge`, `.claude/settings.example.json`, and the agents and skills that came from this repository (see Layout). Check: `grep -c team/hook.py .claude/settings.json` prints `0`.
+Roll back. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself. Then, with `$H` and the keys that step 3 printed after `added env:` (none if the list was empty):
+```
+python3 .claude/team/team.py dashboard stop
+H=<path to the clone> python3 - <keys from "added env"> <<'EOF'
+import json,os,sys
+H=os.environ['H']
+GI='.claude/team/state/\n.claude/team/rituals/\n.claude/backup/\n'
+def strip(p,block):
+    if not os.path.exists(p): return
+    t=open(p).read()
+    for s in ('\n'+block,block):
+        if t.endswith(s): t=t[:-len(s)]; break
+    if t: open(p,'w').write(t)
+    else: os.remove(p)
+p='.claude/settings.json'
+if os.path.exists(p):
+    cur=json.load(open(p)); hk=cur.get('hooks',{})
+    for ev in list(hk):
+        hk[ev]=[e for e in hk[ev] if not any('team/hook.py' in h.get('command','') for h in e.get('hooks',[]))]
+        if not hk[ev]: del hk[ev]
+    for k in sys.argv[1:]: cur.get('env',{}).pop(k,None)
+    for k in ('hooks','env'):
+        if k in cur and not cur[k]: del cur[k]
+    if cur: json.dump(cur,open(p,'w'),indent=2)
+    else: os.remove(p)
+strip('CLAUDE.md',open(H+'/CLAUDE.example.md').read())
+strip('.gitignore',GI)
+EOF
+H=<path to the clone>; (cd "$H" && git ls-files .claude) | while read -r f; do cmp -s "$H/$f" "$f" && rm "$f"; done
+rm -rf .claude/team/state .claude/team/rituals .claude/backup; find .claude -name __pycache__ -prune -exec rm -rf {} +; find .claude -type d -empty -delete
+```
+Files of yours that differ from the clone stay; `diff -rq "$H/.claude" .claude` lists them. Checks: `grep -c team/hook.py .claude/settings.json` prints `0` (or the file is gone), and `diff -r . "../$(basename "$PWD").before"` prints nothing, or only the indentation of `settings.json`.
 
 ## How it works
 
