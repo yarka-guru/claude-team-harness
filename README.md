@@ -19,17 +19,18 @@ Start your coding agent (Claude Code or a similar CLI agent) in the workspace yo
 Install the Claude team harness, cloned at <path to this clone>, into the workspace in the current directory. Follow the "Install with an agent" section of its README.md: run every step and its check, and show me the output. Stop and ask before overwriting or modifying any existing file, and before running any launchd or sudo script. Do not touch ~/.claude. At the end, list what you changed and what is left for me.
 ```
 
-Run from the workspace root. Shell state may not carry over between commands, so begin each command that uses `$H` with `H='<path to the clone>'`. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
+Run from the workspace root. Shell state may not carry over between commands, so the install command sets `H` itself. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
 
-1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` in front of every command below. Snapshot for the rollback check, only if it does not exist yet (delete it when done): `test -e "../$(basename "$PWD").before" || cp -R . "../$(basename "$PWD").before"`.
-2. Install. It copies the clone's tracked `.claude` files without overwriting, adds the hooks, the agent-teams `env` key and `TEAM_PORT` if you set it to `settings.json`, appends `CLAUDE.example.md` to `CLAUDE.md` and, in a git workspace, three lines to `.gitignore`. It is safe to run twice, and records what it did in `.claude/backup/install.json` for the rollback.
+1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. On a first install, `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. On a re-run skip this check and use the `TEAM_PORT` already in `settings.json`, if any. Snapshot for the rollback check, only if it does not exist yet (delete it when done): `test -e "../$(basename "$PWD").before" || cp -R . "../$(basename "$PWD").before"`.
+2. Install. It copies the clone's tracked `.claude` files without overwriting, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, in a git workspace, three lines to `.gitignore`. It is safe to run twice, and records what it did in `.claude/backup/install.json` for the rollback.
 ```
 H='<path to the clone>' python3 - <<'EOF'
-import json,os,subprocess,shutil
+import json,os,subprocess,shutil,hashlib
 H=os.environ['H']; R='.claude/backup/install.json'
 GI='.claude/team/state/\n.claude/team/rituals/\n.claude/backup/\n'
 def rd(p): return open(p,newline='',encoding='utf-8').read() if os.path.exists(p) else None
 def put(p,t,m='w'): open(p,m,newline='',encoding='utf-8').write(t)
+def sha(p): return hashlib.sha256(open(p,'rb').read()).hexdigest()
 rec=json.loads(rd(R) or '{}') or dict(cache=[r for r,d,_ in os.walk('.claude') if '__pycache__' in d],dirs=[d for d in ['.claude'] if not os.path.isdir(d)],runtime=[d for d in GI.split() if not os.path.exists(d)])
 def save(): os.makedirs('.claude/backup',exist_ok=True); put(R,json.dumps(rec))
 save()
@@ -39,7 +40,7 @@ for f in subprocess.check_output(['git','-C',H,'ls-files','-z','.claude'],text=T
         continue
     d=os.path.dirname(f); miss=[]
     while not os.path.isdir(d): miss.insert(0,d); d=os.path.dirname(d)
-    rec['dirs']+=miss; rec.setdefault('files',[]).append(f); save()
+    rec['dirs']+=miss; rec.setdefault('files',{})[f]=sha(H+'/'+f); save()
     os.makedirs(os.path.dirname(f),exist_ok=True); shutil.copy(H+'/'+f,f)
 p='.claude/settings.json'; raw=rd(p); cur=json.loads(raw or '{}'); ex=json.load(open(H+'/.claude/settings.example.json')); before=json.dumps(cur)
 want=dict(ex['env'],**({'TEAM_PORT':os.environ['TEAM_PORT']} if 'TEAM_PORT' in os.environ else {})); env=cur.setdefault('env',{}); new=[k for k in want if k not in env]; env.update({k:want[k] for k in new}); ev=[]
@@ -59,26 +60,27 @@ if os.path.exists('.git'): add('.gitignore',GI,'.claude/team/state/')
 print('env keys added:',rec['env'],'hook events added:',rec['hooks'])
 EOF
 ```
-   Checks: no `kept yours` line (each one is a file of yours that differs from the clone's and was not overwritten); `grep -c team/hook.py .claude/settings.json` prints `8`; `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git repo `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths. If `env keys added` is empty because your settings already set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`, tell the human to check it is `1`. An existing `settings.json` is rewritten with 2-space indentation, content kept.
+   Checks: no `kept yours` line (each one is a file of yours that differs from the clone's and was not overwritten); `grep -c team/hook.py .claude/settings.json` prints `8`; `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git repo `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths. If `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not in `env keys added`, your settings already set it: tell the human to check it is `1`. An existing `settings.json` is rewritten with 2-space indentation, content kept.
 3. Hook smoke test: `echo '{"session_id":"t","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py`. Check: the JSON contains `Team harness on.` It creates `.claude/team/state/team.db` and starts the dashboard.
 4. Log, board, dashboard: `python3 .claude/team/team.py feed --all` prints a line ending `lead session: startup`. `python3 .claude/team/team.py task add "smoke test" --owner lead` prints the new id (`T-<n>`); `python3 .claude/team/team.py board` shows it under `To do`; `python3 .claude/team/team.py task drop T-<n>` prints `ok`. `python3 .claude/team/team.py dashboard start` prints `running http://` (or `started http://`); `failed: ... held by another program` means the port is taken, so go back to step 1.
 5. Gate: `n=$(mktemp) && echo 'Fixed in v1.2.3' > "$n" && printf '{"session_id":"t","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr comment 5 --body-file %s"}}' "$n" | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py; rm "$n"` prints a `permissionDecision` of `deny` that names the version.
 
 Steps that stay with the human:
 
-- The human starts a new `claude` in the workspace and approves any trust prompt, so the SessionStart hook runs for real. Then `team.py feed --all` has a second `lead session: startup` line (the first one is the smoke test).
+- The human starts a new `claude` in the workspace and approves any trust prompt, so the SessionStart hook runs for real. Then `team.py feed --all` has a new `lead session: startup` line after the smoke test's.
 - Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`. Caps per run: daily $3, planning $5, retro $6, reflect $6. Daily and reflect run on 5 weekdays, planning and retro once a week, so the worst case is 5x3 + 5 + 6 + 5x6 = $56 a week. The labels `com.claude-team.*` are per user, not per workspace: installing from a second workspace replaces the first one's jobs, and `uninstall.sh` removes them. Check: `launchctl list | grep com.claude-team` lists four labels. `claude --help` must show `--effort`, `--permission-mode` and `--max-budget-usd`.
 - Local domain: `sudo .claude/team/schedule/install-domain.sh` edits `/etc/hosts`, `pf` and a LaunchDaemon. See "Local domain".
 - Accounts: the Codex CLI, `gh` and the Slack and Jira connectors are the human's; replace the example MCP tool ids in `researcher.md`.
 
-Roll back. It undoes only what the install recorded, so it works after a partial install or a second run, and keeps what you changed since. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
+Roll back. It undoes only what the install recorded, so it works after a partial install or a second run, and keeps your own edits and files added since. It does delete `.claude/team/state` (the event log) and `.claude/team/rituals` (ritual notes) if the install created them. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
 ```
 python3 .claude/team/team.py dashboard stop
-H='<path to the clone>' python3 - <<'EOF'
-import json,os,shutil
-H=os.environ['H']; R='.claude/backup/install.json'
+python3 - <<'EOF'
+import json,os,shutil,hashlib
+R='.claude/backup/install.json'
 def rd(p): return open(p,newline='',encoding='utf-8').read() if os.path.exists(p) else None
 def put(p,t): open(p,'w',newline='',encoding='utf-8').write(t)
+def sha(p): return hashlib.sha256(open(p,'rb').read()).hexdigest()
 rec=json.loads(rd(R) or '{}'); g=rec.get
 for p,s in g('appended',{}).items():
     t=rd(p)
@@ -91,18 +93,24 @@ p='.claude/settings.json'
 if 'settings' in rec and os.path.exists(p):
     raw=rec['settings']; old=json.loads(raw or '{}'); cur=json.loads(rd(p)); hk=cur.get('hooks',{})
     for e in g('hooks',[]):
-        for x in hk.get(e,[]): x['hooks']=[h for h in x.get('hooks',[]) if 'team/hook.py' not in h.get('command','')]
-        hk[e]=[x for x in hk.get(e,[]) if x['hooks']]
-        if not hk[e]: del hk[e]
+        keep=[]
+        for x in hk.get(e,[]):
+            l=[h for h in x.get('hooks',[]) if 'team/hook.py' not in h.get('command','')]
+            gone=len(l)<len(x.get('hooks',[]))
+            if gone: x['hooks']=l
+            if l or not gone: keep.append(x)
+        hk[e]=keep
+        if not keep and e not in old.get('hooks',{}): del hk[e]
     for k in g('env',[]): cur.get('env',{}).pop(k,None)
     for k in ('hooks','env'):
         if k in cur and not cur[k] and k not in old: del cur[k]
     if raw is not None and cur==old: put(p,raw)
     elif cur or raw is not None: put(p,json.dumps(cur,indent=2,ensure_ascii=False)+'\n')
     else: os.remove(p)
-for f in g('files',[]):
-    if rd(f)==rd(H+'/'+f): os.remove(f)
-    elif rd(f) is not None: print('kept, edited since install:',f)
+for f,s in g('files',{}).items():
+    if not os.path.exists(f): continue
+    if sha(f)==s: os.remove(f)
+    else: print('kept, edited since install:',f)
 for d in g('runtime',[]): shutil.rmtree(d,ignore_errors=True)
 for r,ds,_ in os.walk('.claude'):
     if '__pycache__' in ds and r not in g('cache',[]): shutil.rmtree(r+'/__pycache__')
@@ -112,7 +120,7 @@ if os.path.exists(R): os.remove(R)
 print('rolled back' if rec else 'no install record, nothing to undo')
 EOF
 ```
-Each `kept, edited since install` line names a file or appended block you changed after the install; report it to the human and leave it. Check: `diff -r -x .git . "../$(basename "$PWD").before"` prints nothing apart from those.
+Each `kept, edited since install` line names a file or appended block you changed after the install; report it to the human and leave it. Check: `diff -r -x .git . "../$(basename "$PWD").before"` prints nothing apart from those and files added since the install. Tell the human to restart any `claude` session started in the workspace after the install.
 
 ## How it works
 
