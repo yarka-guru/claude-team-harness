@@ -22,8 +22,8 @@ Install the Claude team harness, cloned at <absolute path to this clone>, into t
 Run from the workspace root. Shell state may not carry over between commands, so each command sets what it needs. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
 
 1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. Port: if `.claude/settings.json` already sets `TEAM_PORT`, use that value. Otherwise `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. If `.claude/team/state/team.db` already exists, skip step 4, the `task add` part of step 5 and step 6: they write test rows into the real event log.
-2. Snapshot, the only way back. If the sibling directory exists, stop and ask the human whether it is the snapshot of an earlier run of this install; if so, keep it and go to step 3, otherwise do not touch it. If it does not exist (in a subdirectory of a repository it sits inside that work tree): `s="../$(basename "$PWD").claude-team-before"; mkdir "$s" && { for f in .claude CLAUDE.md .gitignore; do if [ -e "$f" ] || [ -L "$f" ]; then cp -Rp "$f" "$s"/; fi; done; ls -A "$s"; }`. The list shows what exists now; what is missing from it did not exist.
-3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of three lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
+2. Snapshot, the only way back. If the sibling directory exists, stop and ask the human whether it is the snapshot of an earlier run of this install; if so, keep it and go to step 3, otherwise stop: the human decides what happens to it. If it does not exist (in a subdirectory of a repository it sits inside that work tree): `s="../$(basename "$(pwd -P)").claude-team-before"; mkdir "$s" && { ok=1; for f in .claude CLAUDE.md .gitignore; do if [ -e "$f" ] || [ -L "$f" ]; then cp -Rp "$f" "$s"/ || ok=0; fi; done; if [ $ok = 1 ] && touch "$s/.complete"; then ls -A "$s"; else echo "snapshot incomplete"; false; fi; }`. The list shows what exists now, plus `.complete`; what is missing from it did not exist. On `snapshot incomplete` (a copy failed, for example a file you cannot read) tell the human: the directory is theirs to delete before a new try, and nothing may be installed.
+3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no complete snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of three lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
 ```
 H='<absolute path to the clone>' python3 - <<'EOF'
 import json,os,sys,subprocess,shutil
@@ -41,7 +41,7 @@ if cwd==real(os.path.expanduser('~')) or real('.claude') in cfgs or any(cwd==c o
 T=git('-C',H,'ls-files','-z','.claude').split('\0')[:-1]
 if not os.path.isabs(H) or real(git('-C',H,'rev-parse','--show-toplevel').strip() or '/none')!=real(H) or '.claude/team/hook.py' not in T: die('H must be the absolute path of a git clone of the harness')
 s=os.path.join(os.path.dirname(cwd),os.path.basename(cwd)+'.claude-team-before')
-if not os.path.isdir(s): die('no snapshot at '+s+'; make it in step 2')
+if not os.path.isfile(s+'/.complete'): die('no complete snapshot at '+s+'; make it in step 2')
 bad=[f for f in ['CLAUDE.md','.gitignore',p]+T if lk(f) or os.path.lexists(f+'.part')]
 if bad: die('symlinks or leftover .part files (roll back and start again): '+', '.join(bad))
 try:
@@ -91,20 +91,34 @@ Steps that stay with the human:
 - Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`. Caps per run: daily $3, planning $5, retro $6, reflect $6. Daily and reflect run on 5 weekdays, planning and retro once a week, so the worst case is 5x3 + 5 + 6 + 5x6 = $56 a week. The labels `com.claude-team.*` are per user, not per workspace: installing from a second workspace replaces the first one's jobs, and `uninstall.sh` removes them. Check: `launchctl list | grep com.claude-team` lists four labels. `claude --help` must show `--effort`, `--permission-mode` and `--max-budget-usd`.
 - Local domain: `sudo .claude/team/schedule/install-domain.sh` edits `/etc/hosts`, `pf` and a LaunchDaemon. See "Local domain". Accounts: the Codex CLI, `gh` and the Slack and Jira connectors are the human's; replace the example MCP tool ids in `researcher.md`.
 
-Roll back, only on the human's yes. It restores the snapshot of `.claude`, `CLAUDE.md` and `.gitignore`, so it discards every change made to those three since step 2, harness or not. If the install stopped midway or refused because of a leftover `.part` file, roll back and start again from step 1. In order:
+Roll back, only on the human's yes. It restores the snapshot of `.claude`, `CLAUDE.md` and `.gitignore`, so it discards every change made to those three since step 2, harness or not. If the install stopped midway or refused because of a leftover `.part` file, roll back and start again from step 1; a finished rollback leaves `-before` and `-after`, so ask the human to delete or move both before the new snapshot. In order:
 
-1. `python3 .claude/team/team.py dashboard stop` (skip if `.claude/team/team.py` is not there). If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
-2. Show the human what would be discarded: `s="../$(basename "$PWD").claude-team-before"; for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do if [ -e "$s/$f" ] || [ -e "$f" ]; then diff -rqN "$s/$f" "$f"; fi; done` lists every file that differs, and `diff -rN` instead of `diff -rqN` shows the contents. Tell the human to copy out anything they want to keep, then ask for a yes. No snapshot directory means no rollback: say so and stop.
-3. On the yes, run this. It moves the current files into `-after`, deleting nothing, then copies the snapshot back. If it stops midway, run it again: it resumes. If it says `-after` exists and the human has not just started a restore, do not delete `-after`; ask the human. A `restoring.<pid>` directory in `-after` is the partial copy of an interrupted run; ignore it.
+1. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
+2. Show the human what would be discarded: `s="../$(basename "$(pwd -P)").claude-team-before"; for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do if [ -e "$s/$f" ] || [ -e "$f" ]; then diff -rqN --no-dereference "$s/$f" "$f"; fi; done` lists every file that differs, and `diff -rN --no-dereference` instead of `diff -rqN --no-dereference` shows the contents. Tell the human to copy out anything they want to keep, then ask for a yes. No snapshot directory means no rollback: say so and stop.
+3. On the yes, run this. It stops the workspace's dashboard, copies the snapshot aside, moves the current files into `-after` and swaps the copies in, deleting nothing. If it stops midway, run it again: it resumes. If it says `-after` exists, never delete it: stop and ask the human. A `restoring.<pid>` directory in `-after` is the partial copy of an interrupted run; ignore it.
 ```
 bash <<'EOF'
-s="../$(basename "$PWD").claude-team-before"; m="../$(basename "$PWD").claude-team-after"
-[ -d "$s" ] || { echo "refusing: no snapshot"; exit 1; }
-if [ -e "$m" ] && [ ! -e "$m/.restoring" ]; then echo "refusing: $m exists, do not delete it, ask the human"; exit 1; fi
-mkdir -p "$m" && touch "$m/.restoring" && t="$m/restoring.$$" && mkdir "$t" || exit 1
-for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do
-  if { [ -e "$f" ] || [ -L "$f" ]; } && [ ! -e "$m/$f" ]; then mv "$f" "$m"/; fi
-  if { [ -e "$s/$f" ] || [ -L "$s/$f" ]; } && [ ! -e "$f" ] && [ ! -L "$f" ]; then cp -Rp "$s/$f" "$t"/ && mv "$t/$f" .; fi
+s="../$(basename "$(pwd -P)").claude-team-before"; m="../$(basename "$(pwd -P)").claude-team-after"; t="$m/restoring"
+n=".claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part"
+[ -f "$s/.complete" ] || { echo "refusing: no complete snapshot"; exit 1; }
+if [ -e "$m" ] && [ ! -e "$m/.restoring" ] && [ -n "$(ls -A "$m")" ]; then echo "refusing: $m exists, never delete it, ask the human"; exit 1; fi
+if [ -f .claude/team/team.py ]; then python3 .claude/team/team.py dashboard stop || { echo "refusing: stop the dashboard by hand (kill the process that lsof -nP -iTCP:<port> -sTCP:LISTEN shows) and run this again"; exit 1; }; fi
+mkdir -p "$m" && touch "$m/.restoring" || exit 1
+if [ ! -e "$t" ]; then
+  mkdir "$t.$$" || exit 1
+  for f in $n; do
+    if [ -e "$s/$f" ] || [ -L "$s/$f" ]; then cp -Rp "$s/$f" "$t.$$"/ || { echo "refusing: copy failed"; exit 1; }; fi
+  done
+  mv "$t.$$" "$t" || exit 1
+fi
+for f in $n; do
+  if [ -e "$t/$f" ] || [ -L "$t/$f" ] || { [ ! -e "$s/$f" ] && [ ! -L "$s/$f" ]; }; then
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      if [ -e "$m/$f" ] || [ -L "$m/$f" ]; then echo "refusing: $f is back in the workspace and $m/$f exists, ask the human"; exit 1; fi
+      mv "$f" "$m"/ || exit 1
+    fi
+    if [ -e "$t/$f" ] || [ -L "$t/$f" ]; then mv "$t/$f" . || exit 1; fi
+  fi
 done
 rmdir "$t" && rm "$m/.restoring"
 EOF
