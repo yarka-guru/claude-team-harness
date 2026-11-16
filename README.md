@@ -102,7 +102,8 @@ s="../$(basename "$(pwd -P)").claude-team-before"; m="../$(basename "$(pwd -P)")
 n=".claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part"
 [ -f "$s/.complete" ] || { echo "refusing: no complete snapshot"; exit 1; }
 if [ -e "$m" ] && [ ! -e "$m/.restoring" ] && [ -n "$(ls -A "$m")" ]; then echo "refusing: $m exists, never delete it, ask the human"; exit 1; fi
-if [ -f .claude/team/team.py ]; then python3 .claude/team/team.py dashboard stop || { echo "refusing: stop the dashboard by hand (kill the process that lsof -nP -iTCP:<port> -sTCP:LISTEN shows) and run this again"; exit 1; }; fi
+if [ -f .claude/team/team.py ]; then python3 .claude/team/team.py dashboard stop; fi
+p=$(cat .claude/team/state/dashboard.pid 2>/dev/null); if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "refusing: the dashboard (pid $p) still runs; stop it by hand and run this again"; exit 1; fi
 mkdir -p "$m" && touch "$m/.restoring" || exit 1
 if [ ! -e "$t" ]; then
   mkdir "$t.$$" || exit 1
@@ -120,7 +121,7 @@ for f in $n; do
     if [ -e "$t/$f" ] || [ -L "$t/$f" ]; then mv "$t/$f" . || exit 1; fi
   fi
 done
-rmdir "$t" && rm "$m/.restoring"
+rm "$m/.restoring" && rmdir "$t"
 EOF
 ```
 4. Check: the compare command from item 2 prints nothing. Tell the human to restart any `claude` session started in the workspace after the install, and that the `-before` and `-after` directories are theirs to delete (in a subdirectory of a repository they show up there as untracked directories).
