@@ -87,64 +87,69 @@ Steps that stay with the human:
 - Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`. Caps per run: daily $3, planning $5, retro $6, reflect $6. Daily and reflect run on 5 weekdays, planning and retro once a week, so the worst case is 5x3 + 5 + 6 + 5x6 = $56 a week. The labels `com.claude-team.*` are per user, not per workspace: installing from a second workspace replaces the first one's jobs, and `uninstall.sh` removes them. Check: `launchctl list | grep com.claude-team` lists four labels. `claude --help` must show `--effort`, `--permission-mode` and `--max-budget-usd`.
 - Local domain: `sudo .claude/team/schedule/install-domain.sh` edits `/etc/hosts`, `pf` and a LaunchDaemon. See "Local domain". Accounts: the Codex CLI, `gh` and the Slack and Jira connectors are the human's; replace the example MCP tool ids in `researcher.md`.
 
-Roll back. It undoes only what the install recorded, so it works after a partial install or a second run, and keeps your own edits and files added since. It refuses when there is no record of ours, when a recorded path is outside the workspace and when a path it deletes is a symlink. It does delete `.claude/team/state` (the event log) and `.claude/team/rituals` (ritual notes) if the install created them. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
+Roll back. It first compares the current state with the install record and changes nothing; then it removes every recorded item that is unchanged (hook objects, env values, appended blocks, files by sha256, created directories). Items you edited stay, and `hook.py` and `teamlib.py` stay while an edited hook of ours still calls them. It prints one `kept, edited since install` list and one `kept because still used` list. With no record of ours it does nothing: a harness installed by hand is not undone here. It refuses when a recorded path is outside the workspace or when a path it deletes is a symlink. It does delete `.claude/team/state` (the event log) and `.claude/team/rituals` (ritual notes) if the install created them. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
 ```
 python3 - <<'EOF'
 import json,os,sys,subprocess,shutil,hashlib
-R='.claude/team/state/install.json'
+R='.claude/team/state/install.json'; HOOK='/.claude/team/hook.py'
 def rd(p): return open(p,newline='',encoding='utf-8').read() if os.path.exists(p) else None
 def put(p,t):
     open(p+'.part','w',newline='',encoding='utf-8').write(t); shutil.copymode(p,p+'.part'); os.replace(p+'.part',p)
 def sha(p): return hashlib.sha256(open(p,'rb').read()).hexdigest()
-rec=json.loads(rd(R) or '{}'); g=rec.get
-if g('id')!='claude-team-harness': sys.exit('no install record of ours at '+R+', nothing to undo')
-bad=[p for p in list(g('files',{}))+g('dirs',[])+g('runtime',[])+list(g('appended',{})) if os.path.isabs(p) or '..' in p.split('/') or not (p=='.claude' or p.startswith('.claude/') or p in ('CLAUDE.md','.gitignore'))]
 def lk(p): return any(os.path.islink('/'.join(p.split('/')[:i])) for i in range(1,len(p.split('/'))+1))
-links=[p for p in ['.claude/settings.json',R]+list(g('files',{}))+g('dirs',[])+g('runtime',[])+list(g('appended',{})) if lk(p)]
+rec=json.loads(rd(R) or '{}'); g=rec.get
+if g('id')!='claude-team-harness': sys.exit('no install record of ours at '+R+'; a harness installed by hand is not undone here')
+paths=list(g('files',{}))+g('dirs',[])+g('runtime',[])+list(g('appended',{}))
+bad=[p for p in paths if os.path.isabs(p) or '..' in p.split('/') or not (p=='.claude' or p.startswith('.claude/') or p in ('CLAUDE.md','.gitignore'))]
+links=[p for p in ['.claude/settings.json',R]+paths if lk(p)]
 if bad or links: sys.exit('refusing, paths outside the workspace or symlinks: '+', '.join(bad+links))
-if '.claude/team/team.py' in g('files',{}): subprocess.run([sys.executable,'.claude/team/team.py','dashboard','stop'])
+edited=[]; used=[]; todo=[]; keep=()
 for p,s in g('appended',{}).items():
     t=rd(p)
     if t is None: continue
-    if s not in t: print('kept, edited since install:',p); continue
-    t=t.replace(s,'',1)
-    if t or p not in g('new',[]): put(p,t)
-    else: os.remove(p)
+    if s not in t: edited.append(p); continue
+    t=t.replace(s,'',1); todo.append((p,t if t or p not in g('new',[]) else None))
 p='.claude/settings.json'
 if 'settings' in rec and os.path.exists(p):
     raw=rec['settings']; old=json.loads(raw or '{}'); cur=json.loads(rd(p)); hk=cur.get('hooks',{})
     for e,xs in g('hooks',{}).items():
-        ours=[h['command'] for x in xs for h in x['hooks']]; keep=[]
         if e not in hk: continue
+        mine={x.get('matcher'):x['hooks'] for x in xs}; kept=[]
         for y in hk[e]:
-            l=[h for h in y.get('hooks',[]) if h.get('command') not in ours]; gone=len(l)<len(y.get('hooks',[]))
-            if gone: y['hooks']=l
-            if l or not gone: keep.append(y)
-        hk[e]=keep
-        if not keep and e not in old.get('hooks',{}): del hk[e]
-    for e,es in hk.items():
-        if any('/.claude/team/hook.py' in h.get('command','') for y in es for h in y.get('hooks',[])): print('still calls the removed hook.py, remove by hand or every tool call is blocked:',e)
+            hs=y.get('hooks',[]); l=[h for h in hs if h not in mine.get(y.get('matcher'),[])]
+            if len(l)<len(hs): y['hooks']=l
+            if l or len(l)==len(hs): kept.append(y)
+        hk[e]=kept
+        if not kept and e not in old.get('hooks',{}): del hk[e]
+        was=[h for y in old.get('hooks',{}).get(e,[]) for h in y.get('hooks',[])]
+        if [h for y in hk.get(e,[]) for h in y.get('hooks',[]) if HOOK in h.get('command','') and h not in was]: edited.append('hook in '+e); keep=('.claude/team/hook.py','.claude/team/teamlib.py')
     for k,v in g('env',{}).items():
         if cur.get('env',{}).get(k)==v: del cur['env'][k]
-        else: print('kept, edited since install: env',k)
+        elif k in cur.get('env',{}): edited.append('env '+k)
     for k in ('hooks','env'):
         if k in cur and not cur[k] and k not in old: del cur[k]
-    if raw is not None and cur==old: put(p,raw)
-    elif cur or raw is not None: put(p,json.dumps(cur,indent=2,ensure_ascii=False)+'\n')
-    else: os.remove(p)
+    todo.append((p,raw if raw is not None and cur==old else json.dumps(cur,indent=2,ensure_ascii=False)+'\n' if cur or raw is not None else None))
 for f,s in g('files',{}).items():
     if not os.path.exists(f): continue
-    if sha(f)==s: os.remove(f)
-    else: print('kept, edited since install:',f)
+    if f in keep: used.append(f)
+    elif sha(f)==s: todo.append((f,None))
+    else: edited.append(f)
+if '.claude/team/team.py' in g('files',{}): subprocess.run([sys.executable,'.claude/team/team.py','dashboard','stop'])
+for p,t in todo:
+    if t is None: os.remove(p)
+    else: put(p,t)
 os.remove(R)
 for d in g('runtime',[]): shutil.rmtree(d,ignore_errors=True)
 for d in {os.path.dirname(f) for f in g('files',{})}-set(g('cache',[])): shutil.rmtree(d+'/__pycache__',ignore_errors=True)
 for d in sorted(g('dirs',[]),key=len,reverse=True):
     if os.path.isdir(d) and not os.listdir(d): os.rmdir(d)
+if edited: print('kept, edited since install:',', '.join(edited))
+if used: print('kept because still used:',', '.join(used))
+if edited or used: print('finish by hand: remove the edited hooks, env keys and files above, then the kept files')
 print('rolled back')
 EOF
 ```
-Each `kept, edited since install` line names a file, env key or appended block you changed after the install; report it to the human and leave it. Check: `n=$(mktemp -d) && cp -R .claude CLAUDE.md .gitignore "$n"/ 2>/dev/null; diff -r "$n" "../$(basename "$PWD").claude-team-before"` prints nothing apart from those and files added since the install; then delete the snapshot and `$n`. Tell the human to restart any `claude` session started in the workspace after the install.
+Report every kept item to the human and finish by hand. Check: `a="../$(basename "$PWD").claude-team-after"; mkdir "$a" && cp -R .claude CLAUDE.md .gitignore "$a"/ 2>/dev/null; diff -r "$a" "../$(basename "$PWD").claude-team-before"` prints nothing apart from the kept items and files added since the install; then delete both copies. Tell the human to restart any `claude` session started in the workspace after the install.
 
 ## How it works
 
