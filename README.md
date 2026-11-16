@@ -11,6 +11,121 @@ URL overrides both. `TEAM_LANG=uk` switches the CLI board headings and the event
 write. The hook that turns the lead's "What I need from you" block into a "Needs you" item also
 recognises the Ukrainian heading "Що від тебе"; see `CLAUDE.example.md`.
 
+## Install with an agent
+
+Start your coding agent (Claude Code or a similar CLI agent) in the workspace you want to equip and give it this prompt. Replace the path with the absolute path of where you cloned this repository (a `git clone`, not a zip).
+
+```
+Install the Claude team harness, cloned at <absolute path to this clone>, into the workspace in the current directory. Follow the "Install with an agent" section of its README.md: run every step and its check, and show me the output. Stop and ask before overwriting or modifying any existing file, and before running any launchd or sudo script. Do not touch ~/.claude. At the end, list what you changed and what is left for me.
+```
+
+Run from the workspace root. Shell state may not carry over between commands, so each command sets what it needs. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
+
+1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. Port: if `.claude/settings.json` already sets `TEAM_PORT`, use that value. Otherwise `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. If `.claude/team/state/team.db` already exists, skip step 4, the `task add` part of step 5 and step 6: they write test rows into the real event log.
+2. Snapshot, the only way back, into the sibling directory `../<workspace name>.claude-team-before` (`-before` below). If it exists, stop and ask the human whether it is the snapshot of an earlier run of this install; if so, keep it and go to step 3, otherwise stop: the human decides what happens to it. If it does not exist (in a subdirectory of a repository it sits inside that work tree; `-after` below is `../<workspace name>.claude-team-after`): `s="../$(basename "$(pwd -P)").claude-team-before"; mkdir "$s" && { ok=1; for f in .claude CLAUDE.md .gitignore; do if [ -e "$f" ] || [ -L "$f" ]; then cp -Rp "$f" "$s"/ || ok=0; fi; done; if [ $ok = 1 ] && touch "$s/.complete"; then ls -A "$s"; else echo "snapshot incomplete"; false; fi; }`. The list shows what exists now, plus `.complete`; what is missing from it did not exist. On `snapshot incomplete` (a copy failed, for example a file you cannot read) tell the human: the directory is theirs to delete before a new try, and nothing may be installed.
+3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no complete snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of three lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
+```
+H='<absolute path to the clone>' python3 - <<'EOF'
+import json,os,sys,subprocess,shutil
+H=os.environ['H']; GI='.claude/team/state/\n.claude/team/rituals/\n.claude/backup/\n'; real=os.path.realpath; p='.claude/settings.json'
+def die(m): sys.exit('refusing: '+m)
+def rd(p): return open(p,newline='',encoding='utf-8').read() if os.path.exists(p) else None
+def put(p,t,m='w'):
+    t=(rd(p) or '')+t if m=='a' else t; open(p+'.part','w',newline='',encoding='utf-8').write(t)
+    if os.path.exists(p): shutil.copymode(p,p+'.part')
+    os.replace(p+'.part',p)
+def lk(p): return any(os.path.islink('/'.join(p.split('/')[:i])) for i in range(1,len(p.split('/'))+1))
+def git(*a): return subprocess.run(['git']+list(a),capture_output=True,text=True).stdout
+cwd=real('.'); cfgs=[real(os.path.expanduser(c)) for c in ('~/.claude',os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude')]
+if cwd==real(os.path.expanduser('~')) or real('.claude') in cfgs or any(cwd==c or cwd.startswith(c+os.sep) for c in cfgs): die('the workspace is the home directory or the user-global config')
+T=git('-C',H,'ls-files','-z','.claude').split('\0')[:-1]
+if not os.path.isabs(H) or real(git('-C',H,'rev-parse','--show-toplevel').strip() or '/none')!=real(H) or '.claude/team/hook.py' not in T: die('H must be the absolute path of a git clone of the harness')
+s=os.path.join(os.path.dirname(cwd),os.path.basename(cwd)+'.claude-team-before')
+if not os.path.isfile(s+'/.complete'): die('no complete snapshot at '+s+'; make it in step 2')
+bad=[f for f in ['CLAUDE.md','.gitignore',p]+T if lk(f) or os.path.lexists(f+'.part')]
+if bad: die('symlinks or leftover .part files (roll back and start again): '+', '.join(bad))
+try:
+    cur=json.loads(rd(p) or '{}'); ex=json.loads(rd(H+'/.claude/settings.example.json')); md=rd(H+'/CLAUDE.example.md'); old_md=rd('CLAUDE.md') or ''; old_gi=rd('.gitignore') or ''
+    new={f:rd(H+'/'+f) for f in T if not os.path.exists(f)}; [rd(f) for f in T]
+    if None in new.values(): die('the clone is missing tracked files, run git status there')
+    for f in T:
+        d=os.path.dirname(f)
+        while d:
+            if os.path.exists(d) and not os.path.isdir(d): die(d+' is a file')
+            d=os.path.dirname(d)
+except (ValueError,TypeError,OSError) as e: die('cannot read '+str(e)[:200])
+ok=lambda c: isinstance(c,dict) and isinstance(c.get('env',{}),dict) and isinstance(c.get('hooks',{}),dict) and all(isinstance(v,list) and all(isinstance(y,dict) and isinstance(y.get('hooks',[]),list) and all(isinstance(h,dict) for h in y.get('hooks',[])) for y in v) for v in c.get('hooks',{}).values())
+if not ok(cur) or not md: die(p+' must be a JSON object with "env" an object and "hooks" an object of lists of entries')
+port=os.environ.get('TEAM_PORT'); env=cur.get('env',{})
+if port and str(env.get('TEAM_PORT',port))!=port: die('settings.json sets TEAM_PORT='+str(env['TEAM_PORT'])+'; use that port or ask the human')
+before=json.dumps(cur); want=dict(ex['env'],**({'TEAM_PORT':port} if port else {})); env=cur.setdefault('env',{}); added=[k for k in want if k not in env]
+for k in added: env[k]=want[k]
+for e,es in ex['hooks'].items():
+    a=cur.setdefault('hooks',{}).setdefault(e,[])
+    for x in es:
+        if not any(y.get('matcher')==x.get('matcher') and all(h['command'] in [z.get('command') for z in y.get('hooks',[])] for h in x['hooks']) for y in a): a.append(x)
+try: out=json.dumps(cur,indent=2,ensure_ascii=False)+'\n'; out.encode('utf-8')
+except ValueError as e: die('settings.json has text that cannot be written as UTF-8')
+for f in T:
+    if f in new:
+        os.makedirs(os.path.dirname(f),exist_ok=True); shutil.copy(H+'/'+f,f+'.part'); os.replace(f+'.part',f)
+    elif rd(f)!=rd(H+'/'+f): print('kept yours, merge by hand:',f)
+if json.dumps(cur)!=before: put(p,out)
+if md in old_md: pass
+elif '# Team lead mode' in old_md.splitlines(): print('kept yours, merge by hand: CLAUDE.md')
+else: put('CLAUDE.md',('\n' if old_md else '')+md,'a')
+if git('rev-parse','--is-inside-work-tree').strip()=='true':
+    m=''.join(l+'\n' for l in GI.split() if l not in [x.strip() for x in old_gi.splitlines()])
+    if m: put('.gitignore',('\n' if old_gi else '')+m,'a')
+print('env keys added:',added)
+EOF
+```
+   Checks: no `kept yours` line (each one is a file of yours that differs from the clone's, or a `CLAUDE.md` that has the heading but not the block; nothing was overwritten); `grep -c team/hook.py .claude/settings.json` prints `8` (more if you already had hooks that call it); `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git work tree `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths. If `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not in `env keys added`, your settings already set it: tell the human to check it is `1`. An existing `settings.json` is rewritten with 2-space indentation, content kept.
+4. Hook smoke test: `echo '{"session_id":"t","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py`. Check: the JSON contains `Team harness on.` It creates `.claude/team/state/team.db` and starts the dashboard.
+5. Log, board, dashboard: `python3 .claude/team/team.py feed --all` prints a line ending `lead session: startup`. `python3 .claude/team/team.py task add "smoke test" --owner lead` prints the new id (`T-<n>`); `python3 .claude/team/team.py board` shows it under `To do`; `python3 .claude/team/team.py task drop T-<n>` prints `ok`. `python3 .claude/team/team.py dashboard start` prints `running http://` (or `started http://`); `failed: ... held by another program` means the port is taken, so go back to step 1.
+6. Gate: `n=$(mktemp) && echo 'Fixed in v1.2.3' > "$n" && printf '{"session_id":"t","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr comment 5 --body-file %s"}}' "$n" | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py; rm "$n"` prints a `permissionDecision` of `deny` that names the version.
+
+Steps that stay with the human:
+
+- The human starts a new `claude` in the workspace and approves any trust prompt, so the SessionStart hook runs for real. Then `team.py feed --all` has a new `lead session: startup` line after the smoke test's.
+- Rituals: `.claude/team/schedule/install.sh` (macOS) registers four launchd jobs that run `claude -p` unattended with `--permission-mode auto`. Caps per run: daily $3, planning $5, retro $6, reflect $6. Daily and reflect run on 5 weekdays, planning and retro once a week, so the worst case is 5x3 + 5 + 6 + 5x6 = $56 a week. The labels `com.claude-team.*` are per user, not per workspace: installing from a second workspace replaces the first one's jobs, and `uninstall.sh` removes them. Check: `launchctl list | grep com.claude-team` lists four labels. `claude --help` must show `--effort`, `--permission-mode` and `--max-budget-usd`.
+- Local domain: `sudo .claude/team/schedule/install-domain.sh` edits `/etc/hosts`, `pf` and a LaunchDaemon. See "Local domain". Accounts: the Codex CLI, `gh` and the Slack and Jira connectors are the human's; replace the example MCP tool ids in `researcher.md`.
+
+Roll back, only on the human's yes. It restores the snapshot of `.claude`, `CLAUDE.md` and `.gitignore`, so it discards every change made to those three since step 2, harness or not. If the install stopped midway or refused because of a leftover `.part` file, roll back and start again from step 1; a finished rollback leaves `-before` and `-after`, so ask the human to delete or move both before the new snapshot. In order:
+
+1. If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
+2. Show the human what would be discarded: `s="../$(basename "$(pwd -P)").claude-team-before"; nd=; diff --no-dereference /dev/null /dev/null 2>/dev/null && nd=--no-dereference; for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do if [ -e "$s/$f" ] || [ -e "$f" ]; then diff -rqN $nd "$s/$f" "$f"; fi; done` lists every file that differs, and `diff -rN $nd` instead of `diff -rqN $nd` shows the contents. `$nd` is `--no-dereference` when this `diff` supports it; without it a dangling symlink inside `.claude` makes the compare print an error that is not a difference. Tell the human to copy out anything they want to keep, then ask for a yes. No snapshot directory means no rollback: say so and stop.
+3. On the yes, run this. It stops the workspace's dashboard, copies the snapshot aside, moves the current files into `-after` and swaps the copies in, deleting nothing. If it was interrupted (the shell died, no `refusing` line), run it again: it resumes. If it prints any `refusing` line (`-after` exists or is a symlink, a name is back in the workspace, copy failed, no complete snapshot, the dashboard still runs), do not run it again and never delete `-after`: stop and ask the human. A `restoring` or `restoring.<pid>` directory in `-after` is left by an interrupted run (a kill at the very end can leave it empty); ignore it.
+```
+bash <<'EOF'
+s="../$(basename "$(pwd -P)").claude-team-before"; m="../$(basename "$(pwd -P)").claude-team-after"; t="$m/restoring"
+n=".claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part"
+[ -f "$s/.complete" ] || { echo "refusing: no complete snapshot"; exit 1; }
+if [ -L "$m" ] || { [ -e "$m" ] && [ ! -e "$m/.restoring" ] && [ -n "$(ls -A "$m")" ]; }; then echo "refusing: $m exists or is a symlink, never delete it, ask the human"; exit 1; fi
+if [ -f .claude/team/team.py ]; then python3 .claude/team/team.py dashboard stop; fi
+p=$(cat .claude/team/state/dashboard.pid 2>/dev/null); if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -qF "$(pwd -P)/.claude/team/dashboard/server.py"; then echo "refusing: the dashboard (pid $p) still runs; stop it by hand and run this again"; exit 1; fi
+mkdir -p "$m" && touch "$m/.restoring" || exit 1
+if [ ! -e "$t" ]; then
+  mkdir "$t.$$" || exit 1
+  for f in $n; do
+    if [ -e "$s/$f" ] || [ -L "$s/$f" ]; then cp -Rp "$s/$f" "$t.$$"/ || { echo "refusing: copy failed"; exit 1; }; fi
+  done
+  mv "$t.$$" "$t" || exit 1
+fi
+for f in $n; do
+  if [ -e "$t/$f" ] || [ -L "$t/$f" ] || { [ ! -e "$s/$f" ] && [ ! -L "$s/$f" ]; }; then
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      if [ -e "$m/$f" ] || [ -L "$m/$f" ]; then echo "refusing: $f is back in the workspace and $m/$f exists, ask the human"; exit 1; fi
+      mv "$f" "$m"/ || exit 1
+    fi
+    if [ -e "$t/$f" ] || [ -L "$t/$f" ]; then mv "$t/$f" . || exit 1; fi
+  fi
+done
+rm "$m/.restoring" && rmdir "$t"
+EOF
+```
+4. Check: the compare command from item 2 prints nothing. Tell the human to restart any `claude` session started in the workspace after the install, and that the `-before` and `-after` directories are theirs to delete (in a subdirectory of a repository they show up there as untracked directories).
+
 ## How it works
 
 ```
