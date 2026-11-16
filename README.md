@@ -21,7 +21,7 @@ Install the Claude team harness, cloned at <absolute path to this clone>, into t
 
 Run from the workspace root. Shell state may not carry over between commands, so each command sets what it needs. `grep -c` exits 1 when it prints `0`; that is not a failure when `0` is the expected answer.
 
-1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. Port: if `.claude/settings.json` already sets `TEAM_PORT`, use that value. Otherwise `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. If `.claude/team/state/team.db` already exists, skip step 4 and the `task add` part of step 5: they write test rows into the real event log.
+1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. Port: if `.claude/settings.json` already sets `TEAM_PORT`, use that value. Otherwise `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. If `.claude/team/state/team.db` already exists, skip step 4, the `task add` part of step 5 and step 6: they write test rows into the real event log.
 2. Snapshot, the only way back. If the sibling directory exists, stop and ask the human whether it is the snapshot of an earlier run of this install; if so, keep it and go to step 3, otherwise do not touch it. If it does not exist (in a subdirectory of a repository it sits inside that work tree): `s="../$(basename "$PWD").claude-team-before"; mkdir "$s" && { for f in .claude CLAUDE.md .gitignore; do if [ -e "$f" ] || [ -L "$f" ]; then cp -Rp "$f" "$s"/; fi; done; ls -A "$s"; }`. The list shows what exists now; what is missing from it did not exist.
 3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of three lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
 ```
@@ -47,6 +47,7 @@ if bad: die('symlinks or leftover .part files (roll back and start again): '+', 
 try:
     cur=json.loads(rd(p) or '{}'); ex=json.loads(rd(H+'/.claude/settings.example.json')); md=rd(H+'/CLAUDE.example.md'); old_md=rd('CLAUDE.md') or ''; old_gi=rd('.gitignore') or ''
     new={f:rd(H+'/'+f) for f in T if not os.path.exists(f)}; [rd(f) for f in T]
+    if None in new.values(): die('the clone is missing tracked files, run git status there')
     for f in T:
         d=os.path.dirname(f)
         while d:
@@ -94,7 +95,7 @@ Roll back, only on the human's yes. It restores the snapshot of `.claude`, `CLAU
 
 1. `python3 .claude/team/team.py dashboard stop` (skip if `.claude/team/team.py` is not there). If the human installed the schedule or the local domain, ask them to run `.claude/team/schedule/uninstall.sh` and `sudo .claude/team/schedule/uninstall-domain.sh` first; do not run them yourself.
 2. Show the human what would be discarded: `s="../$(basename "$PWD").claude-team-before"; for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do if [ -e "$s/$f" ] || [ -e "$f" ]; then diff -rqN "$s/$f" "$f"; fi; done` lists every file that differs, and `diff -rN` instead of `diff -rqN` shows the contents. Tell the human to copy out anything they want to keep, then ask for a yes. No snapshot directory means no rollback: say so and stop.
-3. On the yes, run this. It moves the current files into `-after`, deleting nothing, then copies the snapshot back. If it stops midway, run it again: it resumes. If it says `-after` exists and the human has not just started a restore, do not delete `-after`; ask the human.
+3. On the yes, run this. It moves the current files into `-after`, deleting nothing, then copies the snapshot back. If it stops midway, run it again: it resumes. If it says `-after` exists and the human has not just started a restore, do not delete `-after`; ask the human. A `restoring.<pid>` directory in `-after` is the partial copy of an interrupted run; ignore it.
 ```
 bash <<'EOF'
 s="../$(basename "$PWD").claude-team-before"; m="../$(basename "$PWD").claude-team-after"
@@ -103,7 +104,7 @@ if [ -e "$m" ] && [ ! -e "$m/.restoring" ]; then echo "refusing: $m exists, do n
 mkdir -p "$m" && touch "$m/.restoring" && t="$m/restoring.$$" && mkdir "$t" || exit 1
 for f in .claude CLAUDE.md .gitignore CLAUDE.md.part .gitignore.part; do
   if { [ -e "$f" ] || [ -L "$f" ]; } && [ ! -e "$m/$f" ]; then mv "$f" "$m"/; fi
-  if [ -e "$s/$f" ] && [ ! -e "$f" ] && [ ! -L "$f" ]; then cp -Rp "$s/$f" "$t"/ && mv "$t/$f" .; fi
+  if { [ -e "$s/$f" ] || [ -L "$s/$f" ]; } && [ ! -e "$f" ] && [ ! -L "$f" ]; then cp -Rp "$s/$f" "$t"/ && mv "$t/$f" .; fi
 done
 rmdir "$t" && rm "$m/.restoring"
 EOF
