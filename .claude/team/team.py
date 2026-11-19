@@ -444,6 +444,14 @@ def cmd_vacuum(con, args):
     print(f"dropped {n} tool events and {m} dedupe keys older than {args.days:g} days")
 
 
+def cmd_ste(args):
+    lint = T.ste_linter()
+    if lint is None:
+        print(f"ste: no linter in {os.environ.get('TEAM_STE_DIR') or T.ROOT / 'ste'}", file=sys.stderr)
+        return 2
+    return lint.main(["--kind", args.kind] + (["--soft"] if args.soft else []) + [args.file])
+
+
 def main():
     p = argparse.ArgumentParser(prog="team", description="Team chat, board and rituals for the Claude dev team")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -508,8 +516,14 @@ def main():
     s = sub.add_parser("transcripts", help="the user's own messages from recent sessions")
     s.add_argument("--hours", type=float, default=24)
     s.add_argument("--width", type=int, default=400)
+    s = sub.add_parser("ste", help="check a draft with the STE linter")
+    s.add_argument("file", help="file to check, or - for stdin")
+    s.add_argument("--kind", default="brief", choices=["brief", "chat", "doc"])
+    s.add_argument("--soft", action="store_true")
 
     args = p.parse_args()
+    if args.cmd == "ste":
+        sys.exit(cmd_ste(args))
     con = T.connect()
     try:
         if args.cmd == "say":

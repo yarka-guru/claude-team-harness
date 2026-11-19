@@ -84,14 +84,21 @@ def on_spawn(con, me, inp, ti):
     tid = T.task_ref(desc, prompt[:300])
     if not T.get_task(con, tid):
         tid = None
+    use_id = inp.get("tool_use_id") or f"anon-{T.now()}"
     con.execute(
         "INSERT OR REPLACE INTO spawns(tool_use_id,session,name,type,description,model,effort,task,ts,prompt_head) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (inp.get("tool_use_id") or f"anon-{T.now()}", me["session"], name, atype, desc, model, effort, tid, T.now(), T.norm(prompt)[:200]),
+        (use_id, me["session"], name, atype, desc, model, effort, tid, T.now(), T.norm(prompt)[:200]),
     )
-    T.emit(con, "spawn", me["handle"], desc, session=me["session"], agent_id=me["agent_id"], actor_type=me["type"],
-           target=name or atype, task=tid,
-           data={"type": atype, "name": name, "model": model, "effort": effort, "isolation": ti.get("isolation"),
-                 "background": ti.get("run_in_background"), "brief": prompt[:1500]})
+    eid = T.emit(con, "spawn", me["handle"], desc, session=me["session"], agent_id=me["agent_id"], actor_type=me["type"],
+                 target=name or atype, task=tid,
+                 data={"type": atype, "name": name, "model": model, "effort": effort, "isolation": ti.get("isolation"),
+                       "background": ti.get("run_in_background"), "brief": prompt[:1500]})
+    return use_id, eid, tid
+
+
+def drop_spawn(con, spawn):
+    con.execute("DELETE FROM spawns WHERE tool_use_id=?", (spawn[0],))
+    con.execute("DELETE FROM events WHERE id=? AND kind='spawn'", (spawn[1],))
 
 
 def on_dm(con, me, ti):
@@ -214,18 +221,45 @@ def git_targets(cmd, cwd):
 
 
 CHAT_VERBS = {"say", "ask", "answer", "decision", "blocker", "handoff", "report"}
+STE_CHAT_KINDS = CHAT_VERBS - {"say"}
+CHAT_OPTIONS = {"--as", "--to", "--task", "--kind"}
+STE_MAX_COMMAND = 200000
+REDIRECT = re.compile(r"\d*(?:[<>]{1,2}|&>)&?")
 
 
-def chat_identity(cmd, handle):
+def chat_posts(cmd):
     if "team.py" not in cmd:
-        return None
+        return
     for seg in T.segments(cmd):
         if not seg[0].startswith("python"):
             continue
         idx = [i for i, t in enumerate(seg) if t.endswith("team.py")]
         if not idx or idx[0] + 1 >= len(seg) or seg[idx[0] + 1] not in CHAT_VERBS:
             continue
-        rest = seg[idx[0] + 1:]
+        yield seg[idx[0] + 1:]
+
+
+def chat_text(rest):
+    words, kind, i = [], None, 1
+    while i < len(rest):
+        t = rest[i]
+        opt = t.split("=", 1)[0]
+        if " " not in t and REDIRECT.match(t):
+            i += 1 if REDIRECT.fullmatch(t) is None else 2
+            continue
+        if opt in CHAT_OPTIONS:
+            value = t[len(opt) + 1:] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
+            kind = value if opt == "--kind" else kind
+            i += 1 if "=" in t else 2
+            continue
+        words.append(t)
+        i += 1
+    kind = rest[0] if rest[0] != "say" else kind
+    return " ".join(words) if kind in STE_CHAT_KINDS else None
+
+
+def chat_identity(cmd, handle, posts=None):
+    for rest in chat_posts(cmd) if posts is None else posts:
         who = None
         for i, t in enumerate(rest):
             if t == "--as":
@@ -362,7 +396,12 @@ def pre_tool(con, inp):
     touch(con, me, inp, tool, ti)
     notes = [n for n in [relink(con, inp, me)] if n]
     if tool == "Agent":
-        on_spawn(con, me, inp, ti)
+        spawn = on_spawn(con, me, inp, ti)
+        verdict = T.fail_open(con, dict(me, task=spawn[2] or me.get("task")), T.ste_check, tool, "brief", ti.get("prompt"))
+        if verdict and verdict[0] == "deny":
+            drop_spawn(con, spawn)
+            return deny(verdict[1])
+        notes += [verdict[1]] if verdict else []
     elif tool == "SubagentHandback" and not me["lead"]:
         con.execute("UPDATE agents SET result=? WHERE agent_id=?", (str(ti.get("message") or "")[:4000], me["agent_id"]))
     elif tool == "AskUserQuestion":
@@ -371,6 +410,11 @@ def pre_tool(con, inp):
         T.emit(con, "needs_user", me["handle"], T.short(text, 300), session=me["session"], agent_id=me["agent_id"], actor_type=me["type"],
                task=me.get("task"), data={"message": text, "type": "ask_user_question"})
     elif tool == "SendMessage":
+        msg = ti.get("message")
+        verdict = T.fail_open(con, me, T.ste_check, tool, "brief", msg) if isinstance(msg, str) else None
+        if verdict and verdict[0] == "deny":
+            return deny(verdict[1])
+        notes += [verdict[1]] if verdict else []
         on_dm(con, me, ti)
     elif tool in T.EDIT_TOOLS:
         T.fail_open(con, me, T.note_authored, tool, ti)
@@ -380,7 +424,9 @@ def pre_tool(con, inp):
         notes += more
     elif tool == "Bash":
         cmd = ti.get("command") or ""
-        bad = None if me["lead"] else chat_identity(cmd, me["handle"])
+        lint = T.ste_mode() != "off" and len(cmd) <= STE_MAX_COMMAND
+        posts = list(chat_posts(cmd)) if lint else None
+        bad = None if me["lead"] else chat_identity(cmd, me["handle"], posts)
         if bad:
             return deny(bad)
         reason = T.fail_open(con, me, T.bash_facts, cmd, inp.get("cwd"))
@@ -389,6 +435,9 @@ def pre_tool(con, inp):
         reason = on_bash(con, me, ti, inp.get("cwd"))
         if reason:
             return deny(reason)
+        for rest in posts or []:
+            verdict = T.fail_open(con, me, T.ste_check, tool, "chat", chat_text(rest))
+            notes += [verdict[1]] if verdict else []
     elif tool.startswith("mcp__"):
         reason = T.fail_open(con, me, T.mcp_facts, tool, ti)
         if reason:

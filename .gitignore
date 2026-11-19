@@ -9,3 +9,4 @@ __pycache__/
 .claude/settings.local.json
 .claude/backup/
 .DS_Store
+.claude/team/ste/

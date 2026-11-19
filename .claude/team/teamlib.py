@@ -1,14 +1,19 @@
+import contextlib
+import io
 import json
 import os
 import re
 import shlex
 import socket
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,25 +29,41 @@ CLI_DOC = "python3 .claude/team/team.py"
 PORT = int(os.environ.get("TEAM_PORT") or 7777)
 ETC = Path(os.environ.get("TEAM_ETC") or "/etc")
 DOMAIN_MARK = " # claude-team"
+STE_MODES = ("off", "warn", "deny")
+STE_NOTE_SHOWN = 6
+STE_LIMIT = 2.0
+STE_DATA = ("ste_lint.py", "avoid.tsv", "terms.tsv")
+_STE_LINT = {}
+
+
+def config_value(key):
+    try:
+        path = Path(os.environ.get("TEAM_CONFIG") or ROOT / "config.json")
+        if path.is_file() and path.stat().st_size <= 4096:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            return data.get(key) if isinstance(data, dict) else None
+    except Exception:
+        return None
+    return None
 
 
 def configured_lang():
-    lang = os.environ.get("TEAM_LANG")
-    if not lang:
-        try:
-            path = Path(os.environ.get("TEAM_CONFIG") or ROOT / "config.json")
-            if path.is_file() and path.stat().st_size <= 4096:
-                data = json.loads(path.read_text(encoding="utf-8-sig"))
-                lang = data.get("lang") if isinstance(data, dict) else None
-        except Exception:
-            lang = None
+    lang = os.environ.get("TEAM_LANG") or config_value("lang")
     lang = str(lang or "").strip().lower() if isinstance(lang, (str, type(None))) else ""
     return "uk" if lang.startswith("uk") or lang == "ua" else "en"
+
+
+def ste_mode():
+    mode = os.environ.get("TEAM_STE") or config_value("ste")
+    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    return mode if mode in STE_MODES else "off"
 
 
 LANG = configured_lang()
 TEXT = {
     "guard.fact": ("fact-check: blocked {what} — {reason}", "фактчек: заблоковано {what} — {reason}"),
+    "guard.ste_error": ("STE check: the linter failed, the text went through unchecked (see {log})",
+                        "STE-перевірка: лінтер впав, текст пропущено без перевірки (див. {log})"),
     "guard.fact_error": ("fact-check: error in {fn}, the call went through unchecked", "фактчек: помилка в {fn}, виклик пропущено без перевірки"),
     "guard.waived": ("fact-check: the lead waived {h} — {reason}", "фактчек: лід пропустив перевірку {h} — {reason}"),
     "guard.git": ("{wt} ({branch}): git operation blocked — {names} editing here", "{wt} ({branch}): заблоковано git-операцію — тут редагує {names}"),
@@ -1510,6 +1531,104 @@ def note_authored(con, me, tool, ti):
     if isinstance(text, str) and text.strip():
         once(con, f"wrote:{fact_hash(text)}:{me['agent_id']}")
     return None
+
+
+def ste_dir():
+    return Path(os.environ.get("TEAM_STE_DIR") or ROOT / "ste")
+
+
+def ste_alarm(signum, frame):
+    raise TimeoutError(f"the STE check took more than {STE_LIMIT:g} s")
+
+
+@contextlib.contextmanager
+def ste_guard():
+    timed = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    if timed:
+        old = signal.signal(signal.SIGALRM, ste_alarm)
+        prev = signal.setitimer(signal.ITIMER_REAL, STE_LIMIT)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            yield
+    finally:
+        if timed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+            if prev[0]:
+                signal.setitimer(signal.ITIMER_REAL, *prev)
+
+
+def ste_linter():
+    import importlib.util
+    path = ste_dir() / "ste_lint.py"
+    if str(path) in _STE_LINT:
+        return _STE_LINT[str(path)]
+    try:
+        spec = importlib.util.spec_from_file_location("ste_lint", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod = mod if callable(getattr(mod, "check", None)) and callable(getattr(mod, "gate", None)) else None
+    except BaseException:
+        mod = None
+    _STE_LINT[str(path)] = mod
+    return mod
+
+
+def ste_log(con, me, what):
+    try:
+        if not once(con, f"ste-log:{what.strip().splitlines()[-1][-160:]}:{int(now() // 600)}"):
+            return
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "ste-errors.log", "a") as f:
+            f.write(time.strftime("%F %T ") + f"{me.get('handle')}\n{what}\n")
+        if what.startswith("Traceback") and once(con, f"ste-guard:{int(now() // 600)}"):
+            emit(con, "guard", me["handle"], msg("guard.ste_error", log=STATE / "ste-errors.log"), session=me["session"],
+                 agent_id=me["agent_id"], actor_type=me["type"], task=me.get("task"), data={"gate": "ste", "error": True})
+    except Exception:
+        pass
+
+
+def ste_note(message, total):
+    lines = message.split("\n")
+    rows = [line for line in lines[1:] if line.startswith("  ") and not line.startswith("  … ")]
+    tail = [line for line in lines[1:] if not line.startswith("  ")]
+    more = [f"  … and {total - STE_NOTE_SHOWN} more"] if total > STE_NOTE_SHOWN else []
+    return "\n".join(lines[:1] + rows[:STE_NOTE_SHOWN] + more + tail)
+
+
+def ste_check(con, me, tool, kind, text):
+    mode = ste_mode()
+    if mode == "off" or not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        missing = [name for name in STE_DATA if not (ste_dir() / name).is_file()]
+        if missing:
+            ste_log(con, me, f"{', '.join(missing)} missing in {ste_dir()}, the STE check is off")
+            return None
+        with ste_guard():
+            lint = ste_linter()
+            result = lint.check(text, kind) if lint else None
+            decision, message = lint.gate(result, mode) if lint else ("allow", "")
+        if lint is None:
+            ste_log(con, me, f"no linter in {ste_dir()}, the STE check is off")
+            return None
+        if result.get("error"):
+            ste_log(con, me, f"linter error: {result['error']}")
+            return None
+        hard, soft = list(result.get("hard") or []), list(result.get("soft") or [])
+        if decision == "deny" and kind != "brief":
+            decision = "warn"
+        if hard:
+            emit(con, "ste", me["handle"], f"{kind}: {len(hard)} hard, {len(soft)} soft, {decision}", session=me["session"],
+                 agent_id=me["agent_id"], actor_type=me["type"], target=tool, task=me.get("task"),
+                 data={"tool": tool, "kind": kind, "words": result.get("words"), "hard": len(hard), "soft": len(soft),
+                       "decision": decision, "rules": dict(Counter(str(f.get("rule")) for f in hard))})
+        if decision not in ("warn", "deny") or not message:
+            return None
+        return decision, str(message) if decision == "deny" else ste_note(str(message), len(hard) + len(soft))
+    except BaseException:
+        ste_log(con, me, traceback.format_exc())
+        return None
 
 
 def fail_open(con, me, fn, *args):

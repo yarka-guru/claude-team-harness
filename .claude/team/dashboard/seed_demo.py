@@ -429,6 +429,19 @@ at(63)
 spawn("codex-2nd", "Second opinion on the index migration",
       "Independent review of the same two diffs. Focus: table locks during the index build, the migration on a "
       "1.2M-row table. Report findings with evidence only.", task=t_index, background=True)
+draft = "Flaky checkout test: 3 of 200 runs failed on a shared test database. Fixed with one database per worker, rollout on Thursday."
+at(60)
+teamlib.fact_record(con, draft, "FAIL", "reviewer-ci", "reviewer", AGENTS["reviewer-ci"][0], S1,
+                    note="\"Thursday\": the release calendar puts the rollout on Friday")
+say("reviewer-ci", "report", "Fact-check FAIL on the Slack draft: \"Thursday\" is wrong, the release calendar puts the "
+    "rollout on Friday. \"3 of 200\" matches the CI log.", target="lead", data={"verdict": "FAIL"})
+at(57)
+draft = draft.replace("Thursday", "Friday")
+teamlib.fact_record(con, draft, "PASS", "reviewer-ci", "reviewer", AGENTS["reviewer-ci"][0], S1,
+                    claims=[{"token": "3 of 200", "source": "CI run log", "source_kind": "primary"},
+                            {"token": "Friday", "source": "release calendar", "source_kind": "primary"}])
+say("reviewer-ci", "report", "Fact-check PASS on the corrected draft: both facts match their sources.", target="lead",
+    data={"verdict": "PASS"})
 move(t_apply, "waiting_user", "Run the prod migration: `! make -C ~/work/recipe-api migrate-prod`", actor="lead")
 move(t_dash, "blocked", f"needs search metrics from {t_api} on staging")
 move(t_syn, "dropped", "nobody asked for typo tolerance yet")

@@ -1,15 +1,92 @@
 # Claude team harness
 
 A local harness that runs a Claude Code session as a team lead with specialist subagents, and
-keeps a shared record of what the team is doing. Hooks write every spawn, tool call, message,
-file edit and finish into a SQLite event log. On top of that log sit a task board, a team chat,
-file claims, a fact-check gate for outward text, and a dashboard in the browser.
+shows what the team does on a dashboard in your browser.
 
-Everything is in English by default. The dashboard also has Ukrainian: it follows the browser
-language, an EN / УК toggle in the header switches it (the choice is saved), and `?lang=en|uk` in the
-URL overrides both. `TEAM_LANG=uk` switches the CLI board headings and the event texts that hooks
-write. The hook that turns the lead's "What I need from you" block into a "Needs you" item also
-recognises the Ukrainian heading "Що від тебе"; see `CLAUDE.example.md`.
+![The dashboard with demo data: what needs you, who works on what, the board and the team chat](docs/screenshots/dashboard.png)
+
+## What you get
+
+- A "Needs you" zone: when the lead ends a reply with a "What I need from you" block, or a card
+  waits for your answer, the item stays at the top of the dashboard until you reply in that
+  session, the lead's next reply ends it, or the card moves on.
+
+  ![Needs you](docs/screenshots/needs-you.png)
+- Who works on what: each running agent with its latest status line and how long it has run.
+
+  ![Who's doing what](docs/screenshots/who.png)
+- A task board: cards `T-n` with status, owner role and model/effort. An Agent call whose
+  description starts with `T-12: ...` attaches to that card. A worker's finished card goes to
+  review, and the lead moves it to done after the check. A reviewer, researcher or Codex run that
+  opened its own card closes it when it stops.
+
+  ![Board](docs/screenshots/board.png)
+- Team chat: agents post asks, answers, decisions, blockers, handoffs and reports with `team.py`,
+  and a message to an agent reaches it on its next tool call. Reviewer verdicts show as PASS or
+  FAIL.
+
+  ![Chat](docs/screenshots/chat.png)
+- File claims: an edit claims the file for that agent. The hook denies an edit of the same file
+  by a different worker agent; the lead gets only a warning, and an edit of a file the lead
+  touched gives only a note. `git checkout`, `stash`, `reset --hard` and similar commands are
+  denied in a worktree where someone else has edits.
+- A fact-check gate for outward text: Slack, Jira, Confluence and `gh` writes that hold dates,
+  numbers, versions or ticket refs are blocked until a reviewer or Codex agent that did not write
+  the text records a PASS with a primary source for each fact.
+- Rituals: skills for a daily, weekly planning, a retro and an evening reflection, optionally run
+  by launchd. The lessons they write are injected into every later run of that role.
+
+The dashboard also works at phone width:
+
+<img src="docs/screenshots/phone.png" alt="The dashboard at phone width" width="300">
+
+The same board in the terminal (`python3 .claude/team/team.py board`):
+
+```
+== Backlog (2)
+  T-7    Alert on search error rate  [-] #recipe-search  2h59m
+  T-11   Saved searches  [-] #recipe-search  2h59m
+== To do (1)
+  T-10   Search page: e2e + screenshots at 3 viewports  [-] #recipe-search  2h59m
+== In progress (2)
+  T-4    Fix flaky test_checkout_totals in CI  [sre-ci opus/high] #flaky-ci  83m — per-worker test databases approved
+  T-9    Search page: results with filters  [eng-search opus/high] #recipe-search  1h51m
+== In review (1)
+  T-5    Search index settings in the deploy chart  [delivery-index sonnet/high] #recipe-search  67m
+== Blocked (1)
+  T-6    Dashboard panel: search latency  [-] #recipe-search  58m — needs search metrics from T-8 on staging
+== Waiting for you (2)
+  T-13   Prod migration for the search index  [lead] #recipe-search  58m — Run the prod migration: `! make -C ~/work/recipe-api migrate-prod`
+  T-14   Triage image-upload issues  [triage-uploads sonnet/medium] #uploads  4m — Product: raise the upload limit to 20 MB, or keep 8 MB and shrink photos in the…
+== Done (2)
+  T-3    Research search: Postgres full-text vs a search service  [researcher-search sonnet/medium] #recipe-search  2h31m — Postgres full-text, GIN
+  T-8    Search API: query parser + types  [eng-search opus/high] #recipe-search  1h51m — review PASS
+```
+
+All pictures use the invented demo data of `.claude/team/dashboard/seed_demo.py`.
+
+## How it works
+
+```
+Claude Code hooks ──> .claude/team/hook.py ──> state/team.db (SQLite)
+                                                   │
+          team.py (CLI: board, chat, factcheck) ───┤
+                                                   └──> dashboard/server.py ──> http://127.0.0.1:7777
+```
+
+Hooks write every spawn, tool call, message, file edit and finish into a SQLite event log. The
+board, the chat, the file claims and the fact-check gate all read and write that log, and the
+dashboard reads it. Each subagent gets the team protocol, a snapshot of the team and its role's
+lessons when it starts. The log and the dashboard stay on your machine; the dashboard listens on
+127.0.0.1 only. Details are in [How it works in detail](#how-it-works-in-detail).
+
+## Quick start
+
+1. Clone this repository.
+2. Give your coding agent the prompt in [Install with an agent](#install-with-an-agent), or follow
+   the manual [Install](#install) steps.
+3. Start `claude` in the workspace. The session brief prints the dashboard URL.
+4. Give the lead a task. Open the URL to watch the team work on it.
 
 ## Install with an agent
 
@@ -126,7 +203,7 @@ EOF
 ```
 4. Check: the compare command from item 2 prints nothing. Tell the human to restart any `claude` session started in the workspace after the install, and that the `-before` and `-after` directories are theirs to delete (in a subdirectory of a repository they show up there as untracked directories).
 
-## How it works
+## How it works in detail
 
 ```
 Claude Code hooks ──> .claude/team/hook.py ──> state/team.db (SQLite, WAL)
@@ -142,11 +219,13 @@ launchd ──> schedule/run-ritual.sh ──> claude -p "/daily" | "/planning" 
   its spawn and board card, injects `PROTOCOL.md`, a team snapshot and role lessons into every
   subagent, and delivers team chat addressed to an agent on its next tool call.
 - Board: cards `T-n` with status, owner role and model/effort. An Agent call whose description
-  starts with `T-12: ...` attaches to that card; an untagged spawn opens its own card. A finished
-  worker's card moves to review; only the lead moves it to done.
-- File claims: every Edit/Write claims the file for that agent. Another agent's edit of the same
-  file is denied, and so are `git checkout/switch/stash/reset --hard/rebase/pull/merge/clean/restore`
-  in a worktree where someone else has edits.
+  starts with `T-12: ...` attaches to that card; an untagged spawn opens its own card. A worker's
+  finished card goes to review, and the lead moves it to done after the check. A reviewer,
+  researcher or Codex run that opened its own card closes it when it stops.
+- File claims: every Edit/Write claims the file for that agent. The hook denies an edit of the
+  same file by a different worker agent; the lead gets only a warning, and an edit of a file the
+  lead touched gives only a note. `git checkout/switch/stash/reset --hard/rebase/pull/merge/clean/restore`
+  is denied, for the lead too, in a worktree where someone else has edits.
 - Fact-check gate: Slack, Jira and Confluence write tools (matched by tool name, any MCP server
   prefix) and `gh pr|issue|release` writes and `gh api` writes are denied while their text holds
   dates, weekdays, times, numbers, versions, ticket/PR refs or cron expressions with no PASS for that
@@ -166,6 +245,17 @@ launchd ──> schedule/run-ritual.sh ──> claude -p "/daily" | "/planning" 
 - Knowledge base: `.claude/knowledge/` starts empty. The team adds one entry per solved problem
   while working and in `reflect`/`retro`; `python3 .claude/skills/kb/kb.py` validates the entries and
   regenerates `INDEX.md`, and agents read the index before they start (skill `kb`).
+- STE check (optional, off by default): the hook passes each Agent brief, SendMessage text and
+  team chat post to an STE linter that you supply, and adds its findings as an `ste:` note to the
+  agent's next context. See [STE check](#ste-check-optional).
+
+### Language
+
+Everything is in English by default. The dashboard also has Ukrainian: it follows the browser
+language, an EN / УК toggle in the header switches it (the choice is saved), and `?lang=en|uk` in the
+URL overrides both. `TEAM_LANG=uk` switches the CLI board headings and the event texts that hooks
+write. The hook that turns the lead's "What I need from you" block into a "Needs you" item also
+recognises the Ukrainian heading "Що від тебе"; see `CLAUDE.example.md`.
 
 ## Layout
 
@@ -177,6 +267,7 @@ CLAUDE.example.md            lead instructions to merge into your CLAUDE.md
                              product-designer, researcher, reviewer, codex
 .claude/skills/              daily, planning, retro, reflect, humanize, kb
 .claude/knowledge/           the knowledge base (README.md and a generated INDEX.md)
+docs/screenshots/            the pictures in this README, made from the demo data
 ```
 
 ## Requirements
@@ -222,6 +313,8 @@ Paths are derived from the files' own location. Environment overrides:
 | `TEAM_AS` | `lead` | default `--as` for the CLI |
 | `TEAM_LANG` | `en` | `uk` for Ukrainian CLI board headings and hook event texts; without it the value comes from `.claude/team/config.json` (`{"lang": "uk"}`), which also reaches the CLI run from a plain terminal |
 | `TEAM_CONFIG` | `.claude/team/config.json` | path of that config file |
+| `TEAM_STE` | `off` | STE check mode: `off`, `warn` or `deny`; without it the value comes from the key `ste` in `config.json` |
+| `TEAM_STE_DIR` | `.claude/team/ste` | directory of your STE linter and its word lists |
 
 The project slug is the workspace's absolute path with every non-alphanumeric character replaced
 by `-`, as Claude Code names its project directories.
@@ -315,6 +408,37 @@ if it was enabled before the first install and is off now, flushes the anchor, r
 the install created it, takes the marked line out of the hosts file and moves the backup to
 `/etc/hosts.claude-team.bak`.
 
+## STE check (optional)
+
+Simplified Technical English (STE, the ASD-STE100 standard) is a controlled English with short
+sentences, one instruction per sentence and a limited vocabulary. The harness can lint agent
+messages against it, but it does not ship a linter or word lists: the standard's copyright notice
+forbids reproduction without written permission from ASD, so you supply them.
+
+The check is off by default. To turn it on:
+
+1. Put all three of these files in `.claude/team/ste/` (or the directory in `TEAM_STE_DIR`):
+   - `ste_lint.py`, a module with `check(text, kind)` and `gate(result, mode)`, and a `main(argv)`
+     for the CLI. `kind` is `brief`, `chat` or `doc`. `check` returns a dict with `words`, `hard` and
+     `soft` (lists of findings, each a dict with at least `rule`) and an optional `error`. `gate`
+     returns `(decision, message)`, where decision is `allow`, `warn` or `deny`. `message` is a
+     summary line, then one finding per line, each indented by two spaces.
+   - `avoid.tsv` and `terms.tsv`, the word lists your linter reads.
+
+   If one of the three files is missing, the check is off.
+2. Set `{"ste": "warn"}` in `.claude/team/config.json`, or `TEAM_STE=warn` in the settings `env`.
+
+In `warn` mode the hook adds the linter's message (the first six findings) to the agent's next
+context and lets the call go through. In `deny` mode it stops an Agent brief or SendMessage when
+`gate` returns `deny`; a chat post is never stopped, only noted. A plain `say` is not checked. If a
+file is missing, the linter fails or takes more than 2 seconds, the call goes through unchecked and
+the reason goes to `state/ste-errors.log`. The 2 second limit works only in the main thread on a
+system with `setitimer` (macOS, Linux). `team.py ste <file>` (or `-` for stdin) runs the linter
+on a draft. `.claude/team/tests/ste_fixture/` holds a small stand-in linter that the tests use; it
+shows the interface and knows only three rules.
+
+PROTOCOL.md tells agents to write in STE only while the check is on.
+
 ## CLI
 
 `T` = `python3 .claude/team/team.py` from the workspace root.
@@ -334,6 +458,7 @@ T digest [--hours 24] | T stats [--days 7] | T transcripts [--hours 24]
 T factcheck tokens|pass|fail|waive|status <file> [--as ...] [--claims claims.json] [--note|--reason ...]
 T ritual <kind> <path> "<summary>"       record a written ritual note
 T vacuum [--days 14]                     drop old tool-activity rows
+T ste <file|-> [--kind brief|chat|doc] [--soft]   check a draft with your STE linter
 python3 .claude/skills/kb/kb.py [--check|--review]   knowledge-base index
 ```
 
@@ -349,6 +474,8 @@ domain tests run both scripts against a temporary `/etc` (`TEAM_ETC`); in that m
 and state go under it too, `launchctl` is only printed, and `TEAM_PFCTL` / `TEAM_IFCONFIG` point at
 fake `pfctl` and `ifconfig` scripts that log their calls. Without them `pfctl` and `ifconfig` are only
 printed too, and `boot.sh` runs only when both fakes are set.
+
+The STE tests use the stand-in linter in `tests/ste_fixture/`, not a linter in `.claude/team/ste/`.
 
 Demo data for the dashboard, in a scratch database (the script refuses to run without both
 variables):

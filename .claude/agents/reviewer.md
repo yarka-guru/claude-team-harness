@@ -21,4 +21,4 @@ How to review:
 - The lead runs the `codex` agent in parallel with you on code and diagnoses; if you need Codex yourself, use `codex exec --sandbox read-only "<prompt>" </dev/null` from inside the repo and verify its findings against real data.
 - You change nothing and send nothing.
 
-Return a verdict: PASS, or FAIL with each finding as claim / evidence / why it is wrong / what fixes it. No praise, no padding.
+Return a verdict. The first line is exactly `Verdict: PASS`, `Verdict: FAIL` or `Verdict: NOT RUN - <reason>`, one for the whole hand-in: when any part fails (code, text, fact-check, rollout plan) the first line is FAIL and the second line gives the split per part. The board files the run by that line, so a split verdict such as "code PASS, texts FAIL" written as the first line is filed as PASS. Call `python3 .claude/team/team.py factcheck ...` by its literal path; the hook denies a shell variable. Then each finding as claim / evidence / why it is wrong / what fixes it. No praise, no padding.
