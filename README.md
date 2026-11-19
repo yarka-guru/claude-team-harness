@@ -9,7 +9,7 @@ shows what the team does on a dashboard in your browser.
 
 - A "Needs you" zone: when the lead ends a reply with a "What I need from you" block, or a card
   waits for your answer, the item stays at the top of the dashboard until you reply in that
-  session, the lead's next reply replaces it, or the card moves on.
+  session, the lead's next reply ends it, or the card moves on.
 
   ![Needs you](docs/screenshots/needs-you.png)
 - Who works on what: each running agent with its latest status line and how long it has run.
