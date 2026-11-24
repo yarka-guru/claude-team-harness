@@ -214,6 +214,8 @@ def snapshot():
             SELECT t.*, COALESCE(t.finished, t.updated) AS since FROM tasks t WHERE t.status='done'
             ORDER BY COALESCE(t.finished, t.updated) DESC LIMIT ?""", (DONE_LIMIT,))
         snap["tasks"] = tasks + done
+        for task in snap["tasks"]:
+            task["security"] = teamlib.scope_label(task["id"])
         snap["done_total"] = (rows(con, "SELECT COUNT(*) AS c FROM tasks WHERE status='done'") or [{"c": 0}])[0]["c"]
         agents = rows(con, """
             SELECT * FROM agents
@@ -300,6 +302,7 @@ def task_detail(tid):
         tools = rows(con, "SELECT COUNT(*) AS c, MAX(ts) AS last FROM events WHERE task=? AND kind='tool'", (tid,))
         agents = normalize_agents(rows(con, "SELECT * FROM agents WHERE task=? ORDER BY started", (tid,)), time.time())
         claims = rows(con, LIVE_CLAIMS + " AND c.task=? ORDER BY c.touched DESC", claim_args(time.time()) + (tid,))
+        found[0]["security"] = teamlib.scope_label(tid)
         return {"task": found[0], "events": [event_dict(r) for r in evs], "agents": agents, "claims": claims,
                 "tool_count": tools[0]["c"] if tools else 0, "tool_last": tools[0]["last"] if tools else None}
     finally:
@@ -342,6 +345,8 @@ def verdict_of(e):
     v = str(d.get("verdict") or "").upper()
     if v in ("PASS", "FAIL"):
         return v
+    if "verdict" in d:
+        return None
     m = VERDICT_RE.search(e["text"] or "")
     return m.group(1) if m else None
 

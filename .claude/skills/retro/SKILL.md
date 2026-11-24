@@ -14,6 +14,7 @@ You are the team lead. The point is a better team next week, so every finding en
    - `T digest --hours 168`.
    - The week's daily and reflect notes, and the previous retro's actions.
    - `T transcripts --hours 168 --width 300`: the user's own messages. Corrections, repeats and frustration ("no", "not like that", "I already said", "again?", "stop", in whatever language the user writes) are escapes: problems the team let through to the user. Each one counts more than any metric.
+   - Security cards (a card with `.claude/team/keep/T-<n>/scope.md`): a `reviewer` scans the transcripts of the card's sessions, the lead's included, against the scope file and lists every tool call that touched a host, account or path outside the scope, every state-changing call on a live target, and every denied call the agent then tried another way. Zero cards this week: say so. Any hit: a waiting_user card the same hour (CLAUDE.md, "Security work").
 2. Analyse, briefly and with numbers:
    - Escapes: what did the user catch that the reviewer and codex did not? Why did the review miss it?
    - Staffing: right role for each card? Model/effort too low (FAILs, rework) or too high (cheap lookups on opus)?

@@ -10,3 +10,4 @@ __pycache__/
 .claude/backup/
 .DS_Store
 .claude/team/ste/
+.claude/team/keep/

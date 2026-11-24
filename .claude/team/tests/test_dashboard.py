@@ -1,7 +1,9 @@
 import argparse
 import http.server
 import io
+import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -269,6 +271,35 @@ class StatusTest(unittest.TestCase):
             srv.close()
         self.assertTrue(up)
         self.assertEqual(detail, f"direct http://127.0.0.1:{port}/ answers")
+
+
+class WhoMoreTest(unittest.TestCase):
+    def test_who_panel_has_a_hidden_rows_mark(self):
+        html = (ROOT / "dashboard" / "index.html").read_text()
+        head = html[html.index('<section class="panel" id="whop"'):].split("</section>", 1)[0]
+        self.assertIn('id="whomore"', head)
+        self.assertIn("function whoMore()", html)
+        self.assertIn("whoMore", html[html.index("function renderWho("):html.index("const KANBAN")])
+
+
+class VerdictTest(unittest.TestCase):
+    CASES = [({"verdict": "none"}, "Verdict: NOT RUN, an older PASS holds", None), ({"verdict": None}, "PASS", None),
+             ({"verdict": "FAIL"}, "PASS", "FAIL"), ({"verdict": "pass"}, "", "PASS"), ({}, "Verdict: PASS", "PASS"), (None, "FAIL now", "FAIL")]
+
+    def test_server_uses_the_stored_verdict(self):
+        for data, text, want in self.CASES:
+            self.assertEqual(S.verdict_of({"data": data, "text": text}), want, (data, text))
+
+    def test_page_uses_the_stored_verdict(self):
+        if not shutil.which("node"):
+            self.skipTest("node is not installed")
+        html = (ROOT / "dashboard" / "index.html").read_text()
+        start = html.index("function verdictOf(e)")
+        fn = html[start:html.index("\nfunction ", start + 1)]
+        cases = json.dumps([{"data": d, "text": t} for d, t, _ in self.CASES])
+        out = subprocess.run(["node", "-e", fn + f"\nconsole.log(JSON.stringify({cases}.map(verdictOf)))"], capture_output=True,
+                             text=True, check=True, timeout=30).stdout
+        self.assertEqual(json.loads(out), [w for _, _, w in self.CASES])
 
 
 if __name__ == "__main__":

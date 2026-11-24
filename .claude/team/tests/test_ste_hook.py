@@ -346,19 +346,19 @@ class OrderTest(Base):
             ste.assert_not_called()
 
     def test_command_parsed_once(self):
-        real = T.segments
-        with mock.patch.object(T, "segments", side_effect=real) as seg:
+        real = hook.quoted_segments
+        with mock.patch.object(hook, "quoted_segments", side_effect=real) as seg:
             self.post("report", BAD)
         self.assertEqual(seg.call_count, 1)
 
     def test_lead_command_not_parsed_when_off(self):
-        real = T.segments
+        real = hook.quoted_segments
         cmd = 'python3 .claude/team/team.py report --as lead "' + BAD + '"'
         for mode, calls in (("off", 0), ("warn", 1)):
-            with mock.patch.dict(os.environ, {"TEAM_STE": mode}), mock.patch.object(T, "segments", side_effect=real) as seg:
+            with mock.patch.dict(os.environ, {"TEAM_STE": mode}), mock.patch.object(hook, "quoted_segments", side_effect=real) as seg:
                 self.run_hook("Bash", {"command": cmd})
             self.assertEqual(seg.call_count, calls, mode)
-        with mock.patch.object(T, "segments", side_effect=real) as seg:
+        with mock.patch.object(hook, "quoted_segments", side_effect=real) as seg:
             self.run_hook("Bash", {"command": cmd.replace(BAD, "x " * 100001)})
         self.assertEqual(seg.call_count, 0)
 
@@ -368,6 +368,57 @@ class OrderTest(Base):
         con.close()
         self.run_hook("Agent", {"subagent_type": "reviewer", "description": "T-7: review", "prompt": BAD})
         self.assertEqual([r["task"] for r in self.rows("SELECT task FROM events WHERE kind='ste'")], ["T-7"])
+
+
+class ChatFormsHookTest(Base):
+    def test_hook_reads_the_three_forms(self):
+        for cmd in ('/usr/bin/python3 ~/x/team.py report "' + BAD + '"', 'env LANG=C python3 ~/x/team.py report "' + BAD + '"'):
+            self.assertIn("--as software-engineer#eng1", self.denied(self.run_hook("Bash", {"command": cmd}, "eng1")), cmd)
+        for cmd in ('/usr/bin/python3 ~/x/team.py report --as software-engineer#eng1 "' + BAD + '"',
+                    'env TEAM_AS=software-engineer#eng1 python3 ~/x/team.py report "' + BAD + '"'):
+            out = self.run_hook("Bash", {"command": cmd}, "eng1")
+            self.assertIsNone(self.denied(out), cmd)
+            self.assertIn("ste:", self.note(out), cmd)
+
+
+class PatternSpeedTest(unittest.TestCase):
+    def test_new_patterns_are_linear(self):
+        code = """
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+import hook, teamlib as T
+fills = ["'" * 2000, "’" * 2000, " " * 2000, "-" * 2000, "not " * 500, "none, " * 400, ":" * 2000, "*" * 2000, "`" * 2000, '"' * 2000,
+         "\\\\" * 2000, "(" * 2000, "PASS/" * 400, "no " * 700, "x:" * 1000, "a - " * 500, "TBD; " * 400, "\\\\\\n" * 1000]
+calls = [lambda x: hook.parse_verdict("Verdict: pass not " + x), lambda x: hook.parse_verdict("Verdict: PASS " + x), hook.parse_verdict,
+         lambda x: hook.user_asks("**Що від тебе**\\nПізніше:\\n- x\\n" + x), lambda x: list(hook.chat_posts("python3 team.py ask --as a " + x)),
+         hook.done_said, lambda x: T.scope_items("## In scope\\n- host: " + x + "\\n"), lambda x: T.scope_approval("2026-01-15, «" + x + "»"),
+         T.scope_lines_of]
+worst = 0.0
+for f in calls:
+    for x in fills:
+        t = time.perf_counter()
+        f(x)
+        worst = max(worst, time.perf_counter() - t)
+print(json.dumps(worst))
+"""
+        out = subprocess.run([sys.executable, "-c", code, str(ROOT)], capture_output=True, text=True, timeout=60, check=True).stdout
+        self.assertLess(json.loads(out), 0.1)
+
+
+class SlowLinterTest(Base):
+    def test_one_timeout_skips_the_other_texts_of_the_call(self):
+        fake = self.fake("import time\n\n\ndef check(text, kind='brief', data_dir=None):\n    time.sleep(5)\n\n\ndef gate(result, mode):\n    return 'deny', 'x'\n")
+        cmd = " && ".join(f'python3 ~/x/team.py {verb} --as software-engineer#eng1 "{BAD} {i}"' for i, verb in enumerate(("ask", "report", "handoff")))
+        with mock.patch.dict(os.environ, {"TEAM_STE_DIR": str(fake)}):
+            for use_id in ("tu-1", "tu-2"):
+                t = time.perf_counter()
+                out = self.run_hook("Bash", {"command": cmd}, "eng1", use_id=use_id)
+                took = time.perf_counter() - t
+                self.assertIsNone(self.denied(out))
+                self.assertGreater(took, T.STE_LIMIT - 0.3, use_id)
+                self.assertLess(took, T.STE_LIMIT + 0.5, use_id)
+        self.assertIn("TimeoutError", (self.dir / "ste-errors.log").read_text())
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
 
 class ChatTextTest(unittest.TestCase):
@@ -382,6 +433,24 @@ class ChatTextTest(unittest.TestCase):
                  ('python3 team.py ask --as a "<file> is missing"', ["<file> is missing"])]
         for cmd, want in cases:
             self.assertEqual([hook.chat_text(r) for r in hook.chat_posts(cmd)], want, cmd)
+
+    def test_quoted_redirect_interpreter_path_and_env_prefix(self):
+        cases = [('python3 team.py ask --as a ">"', [">"]), ('python3 team.py ask --as a "2>&1"', ["2>&1"]),
+                 ("python3 team.py ask --as a '>/tmp/out' is the file", [">/tmp/out is the file"]),
+                 ('python3 team.py ask --as a "x" 2>/dev/null >/tmp/o', ["x"]), ('python3 team.py ask --as a x\\>y', ["x>y"]),
+                 ('/usr/bin/python3 team.py ask --as a "x"', ["x"]), ('/opt/tools/bin/python3.13 ~/t/team.py report --as a "y"', ["y"]),
+                 ('env TEAM_AS=a python3 team.py ask "x"', ["x"]), ('TEAM_AS=a LANG=C python3 team.py ask "x"', ["x"]),
+                 ('env -u X /usr/bin/python3 team.py report --as a "y"', ["y"]), ('python3 team.py ask --as a "open quote', []),
+                 ('python3 team.py report \\\n  --as a "x"', ["x"]), ('python3 team.py report --as a \\\n "x" \\\n 2>/dev/null', ["x"]),
+                 ('python3 team.py ask --as a "x" 2>"/dev/null"', ["x"]), ("python3 team.py ask --as a \"x\" >'/tmp/o'", ["x"]),
+                 ('python3 team.py ask --as a "x" 2> "/dev/null"', ["x"]), ('python3 team.py ask --as a "x" ">" y', ["x > y"])]
+        for cmd, want in cases:
+            self.assertEqual([hook.chat_text(r) for r in hook.chat_posts(cmd)], want, cmd)
+        self.assertIsNone(hook.chat_identity('env TEAM_AS=eng python3 team.py ask "x"', "eng"))
+        self.assertIsNone(hook.chat_identity('TEAM_AS=eng /usr/bin/python3 team.py ask "x"', "eng"))
+        self.assertIn("--as eng", hook.chat_identity('env TEAM_AS=other python3 team.py ask "x"', "eng"))
+        self.assertIn("--as eng", hook.chat_identity('/usr/bin/python3 team.py ask "x"', "eng"))
+        self.assertIsNone(hook.chat_identity('env TEAM_AS=other python3 team.py ask --as eng "x"', "eng"))
 
 
 class CliTest(unittest.TestCase):

@@ -12,9 +12,10 @@ You are the team's bridge to Codex, a different model that catches what Claude a
 How to run it (it hangs forever without closed stdin, and refuses outside a git repo):
 
 ```
-cd <git repo or worktree> && perl -e 'alarm 900; exec @ARGV' codex exec --sandbox read-only "<prompt>" </dev/null > <scratch>/codex-out.txt 2>&1
+cd <git repo or worktree> && perl -e 'alarm 590; exec @ARGV' codex exec --sandbox read-only "<prompt>" </dev/null > <scratch>/codex-out.txt 2>&1
 ```
 
+- Run it as one foreground Bash call with the tool `timeout` set to 600000 (the default 120000 ends your wait while Codex still runs); the 590 s alarm stops Codex before the tool does. No `run_in_background`, no wait loops, no hand-back before the process exits. A review that does not fit in that time gets a narrower prompt.
 - Always `--sandbox read-only`; never let it edit files. Outside a repo add `--skip-git-repo-check`.
 - For a review against the branch: `codex exec review` from the repo, same stdin/alarm wrapping.
 - Write the prompt from the lead's brief: what to look at (paths, branch, base), what to be adversarial about, and the answer shape: findings as path:line / claim / why, and say plainly if nothing is found.

@@ -9,21 +9,26 @@ shows what the team does on a dashboard in your browser.
 
 - A "Needs you" zone: when the lead ends a reply with a "What I need from you" block, or a card
   waits for your answer, the item stays at the top of the dashboard until you reply in that
-  session, the lead's next reply ends it, or the card moves on.
+  session, the lead's next reply ends it, or the card moves on. A block that holds only asks for
+  later ("Later: ...", "Later from you: ...") makes no item. When you tell the lead a step is done
+  ("done", "approved", "sent"), the hook gives the lead the open items to close first;
+  `team.py needs` prints the same list.
 
   ![Needs you](docs/screenshots/needs-you.png)
 - Who works on what: each running agent with its latest status line and how long it has run.
+  When the rows do not fit, a mark at the top says how many more are below.
 
   ![Who's doing what](docs/screenshots/who.png)
 - A task board: cards `T-n` with status, owner role and model/effort. An Agent call whose
   description starts with `T-12: ...` attaches to that card. A worker's finished card goes to
   review, and the lead moves it to done after the check. A reviewer, researcher or Codex run that
-  opened its own card closes it when it stops.
+  opened its own card closes it when it stops. A card with a security scope file carries a red
+  `security` mark.
 
   ![Board](docs/screenshots/board.png)
 - Team chat: agents post asks, answers, decisions, blockers, handoffs and reports with `team.py`,
-  and a message to an agent reaches it on its next tool call. Reviewer verdicts show as PASS or
-  FAIL.
+  and a message to an agent reaches it on its next tool call. Reviewer and Codex verdicts show as
+  PASS or FAIL; a FAIL on any verdict line wins, and `NOT RUN` leaves the run without a verdict.
 
   ![Chat](docs/screenshots/chat.png)
 - File claims: an edit claims the file for that agent. The hook denies an edit of the same file
@@ -33,6 +38,9 @@ shows what the team does on a dashboard in your browser.
 - A fact-check gate for outward text: Slack, Jira, Confluence and `gh` writes that hold dates,
   numbers, versions or ticket refs are blocked until a reviewer or Codex agent that did not write
   the text records a PASS with a primary source for each fact.
+- A scope gate for security work: a brief with a `Security scope:` line goes through only when its
+  card has an approved scope file, and only the lead writes that file. See
+  [Security scope gate](#security-scope-gate).
 - Rituals: skills for a daily, weekly planning, a retro and an evening reflection, optionally run
   by launchd. The lessons they write are injected into every later run of that role.
 
@@ -100,11 +108,11 @@ Run from the workspace root. Shell state may not carry over between commands, so
 
 1. Prerequisites: `python3 --version` prints 3.9 or newer, `claude --version` prints a version, `git` and `lsof` exist. Port: if `.claude/settings.json` already sets `TEAM_PORT`, use that value. Otherwise `lsof -nP -iTCP:7777 -sTCP:LISTEN` prints nothing; if it prints a line, pick a free port and put `TEAM_PORT=<port>` directly in front of each `python3` below. If `.claude/team/state/team.db` already exists, skip step 4, the `task add` part of step 5 and step 6: they write test rows into the real event log.
 2. Snapshot, the only way back, into the sibling directory `../<workspace name>.claude-team-before` (`-before` below). If it exists, stop and ask the human whether it is the snapshot of an earlier run of this install; if so, keep it and go to step 3, otherwise stop: the human decides what happens to it. If it does not exist (in a subdirectory of a repository it sits inside that work tree; `-after` below is `../<workspace name>.claude-team-after`): `s="../$(basename "$(pwd -P)").claude-team-before"; mkdir "$s" && { ok=1; for f in .claude CLAUDE.md .gitignore; do if [ -e "$f" ] || [ -L "$f" ]; then cp -Rp "$f" "$s"/ || ok=0; fi; done; if [ $ok = 1 ] && touch "$s/.complete"; then ls -A "$s"; else echo "snapshot incomplete"; false; fi; }`. The list shows what exists now, plus `.complete`; what is missing from it did not exist. On `snapshot incomplete` (a copy failed, for example a file you cannot read) tell the human: the directory is theirs to delete before a new try, and nothing may be installed.
-3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no complete snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of three lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
+3. Install. It refuses, before writing anything, if the workspace is `~` or `~/.claude`, if there is no complete snapshot, if a path it writes or a parent of it is a symlink, if a `<file>.part` is in the way, if `settings.json` is not a JSON object of the expected shape, if `TEAM_PORT` differs from the one in `settings.json`, or if the path is not the root of a git clone of this repository. Otherwise it copies the clone's tracked `.claude` files without overwriting yours, adds the hooks and the agent-teams `env` key to `settings.json` (plus `TEAM_PORT` if you set it), appends `CLAUDE.example.md` to `CLAUDE.md` and, inside a git work tree, whichever of four lines are missing to `.gitignore`. Every write goes through a `.part` file. A re-run adds only what is missing.
 ```
 H='<absolute path to the clone>' python3 - <<'EOF'
 import json,os,sys,subprocess,shutil
-H=os.environ['H']; GI='.claude/team/state/\n.claude/team/rituals/\n.claude/backup/\n'; real=os.path.realpath; p='.claude/settings.json'
+H=os.environ['H']; GI='.claude/team/state/\n.claude/team/rituals/\n.claude/team/keep/\n.claude/backup/\n'; real=os.path.realpath; p='.claude/settings.json'
 def die(m): sys.exit('refusing: '+m)
 def rd(p): return open(p,newline='',encoding='utf-8').read() if os.path.exists(p) else None
 def put(p,t,m='w'):
@@ -157,7 +165,7 @@ if git('rev-parse','--is-inside-work-tree').strip()=='true':
 print('env keys added:',added)
 EOF
 ```
-   Checks: no `kept yours` line (each one is a file of yours that differs from the clone's, or a `CLAUDE.md` that has the heading but not the block; nothing was overwritten); `grep -c team/hook.py .claude/settings.json` prints `8` (more if you already had hooks that call it); `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git work tree `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/backup/x` prints all three paths. If `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not in `env keys added`, your settings already set it: tell the human to check it is `1`. An existing `settings.json` is rewritten with 2-space indentation, content kept.
+   Checks: no `kept yours` line (each one is a file of yours that differs from the clone's, or a `CLAUDE.md` that has the heading but not the block; nothing was overwritten); `grep -c team/hook.py .claude/settings.json` prints `8` (more if you already had hooks that call it); `grep -c '^# Team lead mode' CLAUDE.md` prints `1`; in a git work tree `git check-ignore .claude/team/state/team.db .claude/team/rituals/x .claude/team/keep/x .claude/backup/x` prints all four paths. If `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is not in `env keys added`, your settings already set it: tell the human to check it is `1`. An existing `settings.json` is rewritten with 2-space indentation, content kept.
 4. Hook smoke test: `echo '{"session_id":"t","hook_event_name":"SessionStart","source":"startup"}' | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py`. Check: the JSON contains `Team harness on.` It creates `.claude/team/state/team.db` and starts the dashboard.
 5. Log, board, dashboard: `python3 .claude/team/team.py feed --all` prints a line ending `lead session: startup`. `python3 .claude/team/team.py task add "smoke test" --owner lead` prints the new id (`T-<n>`); `python3 .claude/team/team.py board` shows it under `To do`; `python3 .claude/team/team.py task drop T-<n>` prints `ok`. `python3 .claude/team/team.py dashboard start` prints `running http://` (or `started http://`); `failed: ... held by another program` means the port is taken, so go back to step 1.
 6. Gate: `n=$(mktemp) && echo 'Fixed in v1.2.3' > "$n" && printf '{"session_id":"t","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr comment 5 --body-file %s"}}' "$n" | CLAUDE_PROJECT_DIR="$PWD" python3 .claude/team/hook.py; rm "$n"` prints a `permissionDecision` of `deny` that names the version.
@@ -232,6 +240,20 @@ launchd ──> schedule/run-ritual.sh ──> claude -p "/daily" | "/planning" 
   exact text in the last 24 hours. A `reviewer` or `codex` agent that did not write the text
   records the PASS with one primary source per fact (`team.py factcheck pass`). It also checks that
   weekdays match dates and that a "first run" date is the schedule's real first firing.
+- Verdicts: when a `reviewer` or `codex` agent stops, the hook reads its verdict from the report.
+  It reads every line in the first 600 characters that has the word "verdict" in its first 80
+  characters: a fail on any of them makes the run FAIL, otherwise `NOT RUN` or `NOT COMPLETED`
+  leaves it without a verdict, otherwise PASS. A report without such a line is read from its first
+  line and the PASS/FAIL words in its first 600 characters. The board and the dashboard show the
+  stored verdict.
+- "Needs you": the `Stop` hook reads the "What I need from you" block of the lead's reply. Asks
+  under a "Later" label and "Later from you: ..." lines do not count: a block with only such asks
+  makes no item. A "Now", "Today" or "Urgent" label or another short label after them starts a
+  part that counts again, and a "Status" or "Notes" heading ends the block. A block with at least
+  one current ask becomes an item that holds the full block text, later asks included. When the user's next prompt says a step is done ("done",
+  "approved", "sent", not as a question), the `UserPromptSubmit` hook adds the open asks of that
+  session and every waiting_user card to the lead's context, with the command that closes each card.
+- Security scope gate: see [Security scope gate](#security-scope-gate).
 - Dashboard: `dashboard/server.py` listens on 127.0.0.1 only and accepts only its own host names.
   Every `GET` endpoint reads the database without writing to it. The one write endpoint is
   `POST /api/focus` (same-origin, an `X-Team-Action: focus` header, at most one call per second): it
@@ -241,7 +263,10 @@ launchd ──> schedule/run-ritual.sh ──> claude -p "/daily" | "/planning" 
   chat over loopback, so do not run it on a shared machine.
 - Rituals: skills `daily`, `planning`, `retro` and `reflect`. `schedule/install.sh` registers
   launchd jobs (macOS) that run them headless with `claude -p`. Notes land in
-  `.claude/team/rituals/<kind>/<date>.md`.
+  `.claude/team/rituals/<kind>/<date>.md`. `run-ritual.sh` runs one ritual at a time with
+  `lockf` on `.claude/team/state/ritual.lock`: a ritual that finds the lock taken waits for it up
+  to `RITUAL_LOCK_WAIT` seconds (default 5400), then runs only if the day has not changed, its
+  note is still missing and the hour is still in its window.
 - Knowledge base: `.claude/knowledge/` starts empty. The team adds one entry per solved problem
   while working and in `reflect`/`retro`; `python3 .claude/skills/kb/kb.py` validates the entries and
   regenerates `INDEX.md`, and agents read the index before they start (skill `kb`).
@@ -262,7 +287,7 @@ recognises the Ukrainian heading "Що від тебе"; see `CLAUDE.example.md`
 ```
 CLAUDE.example.md            lead instructions to merge into your CLAUDE.md
 .claude/settings.example.json  hooks wiring to merge into .claude/settings.json
-.claude/team/                hook.py, team.py, teamlib.py, PROTOCOL.md, lessons/, schedule/, dashboard/, tests/
+.claude/team/                hook.py, team.py, teamlib.py, PROTOCOL.md, lessons/, schedule/, dashboard/, security/, tests/
 .claude/agents/              role templates: software-engineer, delivery-engineer, platform-sre,
                              product-designer, researcher, reviewer, codex
 .claude/skills/              daily, planning, retro, reflect, humanize, kb
@@ -291,8 +316,9 @@ docs/screenshots/            the pictures in this README, made from the demo dat
    uses `$CLAUDE_PROJECT_DIR`, so no paths need editing.
 3. Append `CLAUDE.example.md` to `<workspace>/CLAUDE.md` and adjust the model table and reporting
    language to taste.
-4. Add these to your workspace `.gitignore`: `.claude/team/state/`, `.claude/team/rituals/` and
-   `.claude/backup/`. The event log stores prompts, agent briefs and drafts.
+4. Add these to your workspace `.gitignore`: `.claude/team/state/`, `.claude/team/rituals/`,
+   `.claude/team/keep/` and `.claude/backup/`. The event log stores prompts, agent briefs and
+   drafts, and scope files in `keep/` can name hosts and accounts.
 5. Start `claude` in the workspace. The session brief prints the dashboard URL and the CLI path.
 6. Optional rituals: `.claude/team/schedule/install.sh` (uninstall with `uninstall.sh`).
    `RITUAL_MODEL` sets the model for planning, retro and reflect (default `opus`); `CLAUDE_BIN`
@@ -315,6 +341,9 @@ Paths are derived from the files' own location. Environment overrides:
 | `TEAM_CONFIG` | `.claude/team/config.json` | path of that config file |
 | `TEAM_STE` | `off` | STE check mode: `off`, `warn` or `deny`; without it the value comes from the key `ste` in `config.json` |
 | `TEAM_STE_DIR` | `.claude/team/ste` | directory of your STE linter and its word lists |
+| `TEAM_SECURITY` | `deny` | security scope gate mode: `off`, `warn` or `deny`; without it the value comes from the key `security` in `config.json` |
+| `TEAM_KEEP` | `.claude/team/keep` | folder of `T-<n>/scope.md` scope files and scripts kept for later |
+| `RITUAL_LOCK_WAIT` | `5400` | `run-ritual.sh` only: seconds a ritual waits for another one to finish |
 
 The project slug is the workspace's absolute path with every non-alphanumeric character replaced
 by `-`, as Claude Code names its project directories.
@@ -439,6 +468,37 @@ shows the interface and knows only three rules.
 
 PROTOCOL.md tells agents to write in STE only while the check is on.
 
+## Security scope gate
+
+Security work here means a run of an exploit or proof of concept, a scan, fuzzing, a
+prompt-injection or guardrail test, or a sandbox probe. Before such a run the lead copies
+`.claude/team/security/scope-template.md` to `.claude/team/keep/T-<n>/scope.md` and fills it: the
+owner of the target, the user's approval with a date and their words in quote marks, the in-scope
+targets, permitted actions, the network boundary and stop conditions. The brief then carries a
+line `Security scope: ...` with the limits.
+
+The hook (`PreToolUse`) checks Agent briefs and SendMessage texts:
+
+- A text with a `Security scope:` line is denied unless its card is on the board and the card's
+  `scope.md` is a regular file of at most 64 KB with a dated approval that is not a refusal, an
+  owner line that starts with "the user" or "employer, local copy", and at least one filled
+  "In scope" item. A line that names another card, or two cards, is denied too.
+- A brief on a card that has a scope file and no `Security scope:` line is denied; a `reviewer`,
+  `codex`, `researcher`, `Explore` or `Plan` run gets a note instead. A `codex` run on such a card
+  also gets a note not to pass it the scope file or the card's transcripts.
+- A text with security words (exploit, PoC, fuzz, port scan, prompt injection and similar) and no
+  `Security scope:` line gets a note only: the hook cannot tell a security card that has no scope
+  file, so writing it is the lead's step.
+- Only the lead writes `scope.md`: an Edit or Write of it by another agent is denied. A Bash
+  command that names it together with a write gets a note.
+
+Each note and denial is a `security` event in `team.py feed` and a red row in the dashboard chat.
+The default mode is `deny`; `{"security": "warn"}` in `.claude/team/config.json` or
+`TEAM_SECURITY=warn` turns denials into notes, and `off` turns the gate off. An error inside the
+gate lets the call through and goes to `state/security-errors.log`. Ordinary briefs with no
+`Security scope:` line, on cards with no scope file, are not affected. Scope files can name hosts
+and accounts: the install adds `.claude/team/keep/` to the workspace `.gitignore`.
+
 ## CLI
 
 `T` = `python3 .claude/team/team.py` from the workspace root.
@@ -450,6 +510,7 @@ T task start|review|block|wait|done|drop|todo|backlog T-n [--note ...]
 T task show|note T-n ...
 T say|ask|answer|decision|blocker|handoff|report --as <handle> [--to <handle|role|all>] [--task T-n] "text"
 T feed [-n 40] [--all]                   recent chat and events
+T needs [--session S] [--all] [--width 200]   open "Needs you" items: unanswered asks and waiting_user cards
 T read <id>...                           a message in full
 T who                                    running agents and the files they hold
 T release [--path P] [--force]           drop your file claims
@@ -476,6 +537,8 @@ fake `pfctl` and `ifconfig` scripts that log their calls. Without them `pfctl` a
 printed too, and `boot.sh` runs only when both fakes are set.
 
 The STE tests use the stand-in linter in `tests/ste_fixture/`, not a linter in `.claude/team/ste/`.
+One dashboard test runs the page's verdict function in `node` and is skipped when `node` is not
+installed.
 
 Demo data for the dashboard, in a scratch database (the script refuses to run without both
 variables):
