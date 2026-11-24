@@ -10,3 +10,4 @@
 - Text for a public repo (PR body, commit, issue) holds nothing about the author's machine, network or accounts: a test that fails only locally is left out or described by its CI result.
 - A script the user runs that prints more than one value says next to each value what to do with it (which field to paste it into, or "compare only, do not paste") and prints the web-form choices on screen.
 - A report gives a separate verdict for every finding named in the card title; a finding you did not check is listed as "not checked".
+- A fix for a hole that is still open somewhere, in a public repo: the PR body, commit message, test ids and docs state the new rule, never the inputs or headers that worked before the fix. Give `ids=` with neutral labels to every `parametrize` whose values are such inputs, because `pytest -v` prints them into the public CI log.
