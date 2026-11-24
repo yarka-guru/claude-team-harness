@@ -253,7 +253,7 @@ button.taskref:hover { background: #2f3842; }
 .spawn .sd { margin-top: 3px; }
 pre.brief { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 16px; color: var(--ink2); background: var(--bg); border: 1px solid var(--hair); border-radius: 6px; padding: 8px 10px; margin: 6px 0 0; max-height: 360px; overflow-y: auto; }
 .warn { margin: 4px 18px 4px 58px; padding: 6px 10px 7px; border-radius: 6px; border: 1px solid color-mix(in srgb, var(--kc) 45%, transparent); background: color-mix(in srgb, var(--kc) 9%, transparent); }
-.warn.k-overlap { --kc: var(--you); } .warn.k-conflict, .warn.k-guard { --kc: var(--bad); }
+.warn.k-overlap { --kc: var(--you); } .warn.k-conflict, .warn.k-guard, .warn.k-security { --kc: var(--bad); }
 .warn .wh { display: flex; gap: 7px; align-items: baseline; flex-wrap: wrap; position: relative; padding-right: 48px; }
 .warn .wh .tm { position: absolute; right: 0; top: 1px; }
 .warn .wl { font-weight: 600; color: var(--kc); }
@@ -468,6 +468,7 @@ header .chip { background: rgba(255, 255, 255, .08); border: 1px solid rgba(255,
 .kcard .ko i { width: 8px; height: 8px; border-radius: 50%; background: var(--c); flex: none; }
 .kcard .ko.none { color: var(--ink2); }
 .kcard .chip { color: var(--ink2); border: 1px solid var(--hair); border-radius: 999px; padding: 0 8px; line-height: 22px; white-space: nowrap; }
+.kcard .chip.sec { color: var(--bad); border-color: var(--bad); font-size: 14px; line-height: 20px; }
 .kmore2 { flex: none; color: var(--ink2); border: 1px dashed var(--hair); border-radius: 12px; padding: 4px 10px; text-align: center; }
 .kmore2:hover { color: var(--ink); }
 #needp .scroll:has(.ni.open) { max-height: min(40vh, 260px); }
@@ -564,7 +565,7 @@ header .chip { background: rgba(255, 255, 255, .08); border: 1px solid rgba(255,
 <nav id="tabs" role="tablist"></nav>
 <div id="kpis"></div>
 <section class="panel" id="needp" aria-live="polite" data-i18n-aria="need.title"></section>
-<section class="panel" id="whop" data-i18n-aria="who.title"><div class="ph"><h2 data-i18n="who.title"></h2><span id="whos"></span><span class="r" data-i18n="who.actionsHour"></span></div><div class="scroll"><ul id="who"></ul></div></section>
+<section class="panel" id="whop" data-i18n-aria="who.title"><div class="ph"><h2 data-i18n="who.title"></h2><span id="whos"></span><button class="kanmore" id="whomore" hidden></button><span class="r" data-i18n="who.actionsHour"></span></div><div class="scroll"><ul id="who"></ul></div></section>
 <section class="panel" id="boardp" data-i18n-aria="board.title"><div class="ph"><h2 data-i18n="board.title"></h2><span id="bsum"></span><button class="kanmore" id="kanmore" hidden></button></div><div id="kanban"></div></section>
 <section class="panel" id="chatp" data-i18n-aria="chat.title"><div class="ph"><h2 data-i18n="chat.title"></h2><span data-i18n="chat.newest"></span><span class="r" data-i18n="chat.hover"></span></div><div class="filters" id="filters" role="group" data-i18n-aria="chat.filterAria"></div><div class="scroll" id="chatscroll"><ul id="chat"></ul></div></section>
 <div id="ritualshome"><div id="ritualsview"><div id="rlist"></div><div id="rdoc"></div></div></div>
@@ -590,7 +591,7 @@ function ritLabel(kind) { return has("rit." + kind) ? t("rit." + kind) : kind; }
 const RITUAL_PLAN = { daily: [[1, 2, 3, 4, 5], "09:07"], planning: [[1], "09:37"], retro: [[5], "16:07"], reflect: [[1, 2, 3, 4, 5], "18:47"] };
 const CHAT_KINDS = new Set(["say", "ask", "answer", "decision", "blocker", "handoff", "report", "dm"]);
 const KIND_LABELED = new Set(["ask", "answer", "decision", "blocker", "handoff", "report", "dm"]);
-const WARN_KINDS = new Set(["overlap", "conflict", "guard"]);
+const WARN_KINDS = new Set(["overlap", "conflict", "guard", "security"]);
 const CHAT_FILTERS = ["all", "a2a", "you", "dec", "rep", "ord"];
 const MAX_MSGS = 400;
 
@@ -621,7 +622,7 @@ const I18N = {
     "rit.daily": "Daily", "rit.planning": "Planning", "rit.retro": "Retro", "rit.reflect": "Reflection", "rit.ritual": "ritual",
     "kind.ask": "question", "kind.answer": "answer", "kind.decision": "decision", "kind.blocker": "blocker", "kind.handoff": "handoff", "kind.report": "report", "kind.dm": "direct message", "kind.say": "message",
     "kind.order": "assignment", "kind.request": "your request", "kind.yourAnswer": "your answer", "kind.needsYou": "needs you",
-    "warn.overlap": "Overlap", "warn.conflict": "Conflict", "warn.guard": "Git guard",
+    "warn.overlap": "Overlap", "warn.conflict": "Conflict", "warn.guard": "Git guard", "warn.security": "Security",
     "filter.all": "All", "filter.a2a": "Between agents", "filter.you": "To you", "filter.dec": "Decisions", "filter.rep": "Reports", "filter.ord": "Assignments",
     "need.decision": "decision", "need.command": "command", "need.approve": "approval", "need.prompt": "session waiting", "need.permission": "permission", "need.question": "question", "need.form": "form",
     "u.s": "s", "u.min": "min", "u.h": "h", "u.d": "d", "justNow": "just now", "ago": "{r} ago", "today": "Today", "yesterday": "Yesterday", "todayLc": "today", "yesterdayLc": "yesterday", "daysAgo": "{n} d ago",
@@ -657,7 +658,7 @@ const I18N = {
     "need.oldest": "oldest first", "need.live": "session waiting", "need.openTask": "open {id}", "need.calm": "Nothing needed from you", "need.calmToday": "waited {n} {times} today · {m} min",
     "who.now": "now: {x}", "who.sparkTitle": "actions per 5 min over the last hour", "who.starting": "starting…", "who.waiting": "waiting on you for {m} min", "who.quiet": "quiet for {m} min",
     "who.ghost": "no activity for {m} min", "who.and": " and ", "who.justDone": "Just delivered:", "who.at": " at {t}", "who.nobody": "Nobody is working right now.", "who.working": "{n} working",
-    "board.limit": "WIP limit {n}", "board.moreCols": "→ {n} more {columns}", "board.expand": " — expand", "board.workingNow": "working now",
+    "board.limit": "WIP limit {n}", "board.moreCols": "→ {n} more {columns}", "board.expand": " — expand", "board.workingNow": "working now", "board.security": "security",
     "chat.emptyFilter": "Nothing in this filter yet.", "chat.empty": "Quiet so far. Messages will appear here once the team starts working.",
   },
   uk: {
@@ -674,7 +675,7 @@ const I18N = {
     "rit.daily": "Дейлі", "rit.planning": "Планування", "rit.retro": "Ретро", "rit.reflect": "Рефлексія", "rit.ritual": "ритуал",
     "kind.ask": "питання", "kind.answer": "відповідь", "kind.decision": "рішення", "kind.blocker": "блокер", "kind.handoff": "передача", "kind.report": "звіт", "kind.dm": "особисто", "kind.say": "повідомлення",
     "kind.order": "доручення", "kind.request": "твій запит", "kind.yourAnswer": "твоя відповідь", "kind.needsYou": "потрібен ти",
-    "warn.overlap": "Перетин", "warn.conflict": "Конфлікт", "warn.guard": "Захист git",
+    "warn.overlap": "Перетин", "warn.conflict": "Конфлікт", "warn.guard": "Захист git", "warn.security": "Безпека",
     "filter.all": "Усе", "filter.a2a": "Між агентами", "filter.you": "Тобі", "filter.dec": "Рішення", "filter.rep": "Звіти", "filter.ord": "Доручення",
     "need.decision": "рішення", "need.command": "команда", "need.approve": "погодження", "need.prompt": "сесія чекає", "need.permission": "дозвіл", "need.question": "питання", "need.form": "форма",
     "u.s": "с", "u.min": "хв", "u.h": "год", "u.d": "д", "justNow": "щойно", "ago": "{r} тому", "today": "Сьогодні", "yesterday": "Вчора", "todayLc": "сьогодні", "yesterdayLc": "вчора", "daysAgo": "{n} д тому",
@@ -710,7 +711,7 @@ const I18N = {
     "need.oldest": "найстаріше згори", "need.live": "сесія чекає", "need.openTask": "відкрити {id}", "need.calm": "Від тебе нічого не потрібно", "need.calmToday": "сьогодні чекали {n} {times} · {m} хв",
     "who.now": "зараз: {x}", "who.sparkTitle": "дії по 5 хв за останню годину", "who.starting": "стартує…", "who.waiting": "чекає на тебе {m} хв", "who.quiet": "тиша {m} хв",
     "who.ghost": "без ознак життя {m} хв", "who.and": " і ", "who.justDone": "Щойно здали:", "who.at": " о {t}", "who.nobody": "Зараз ніхто не працює.", "who.working": "{n} {working}",
-    "board.limit": "ліміт роботи {n}", "board.moreCols": "→ ще {n} {columns}", "board.expand": " — розгорнути", "board.workingNow": "працює зараз",
+    "board.limit": "ліміт роботи {n}", "board.moreCols": "→ ще {n} {columns}", "board.expand": " — розгорнути", "board.workingNow": "працює зараз", "board.security": "безпека",
     "chat.emptyFilter": "У цьому фільтрі поки порожньо.", "chat.empty": "Ще тихо. Коли команда почне роботу, повідомлення з'являться тут.",
   },
 };
@@ -1180,6 +1181,7 @@ function verdictOf(e) {
   const d = e.data && typeof e.data === "object" ? e.data : {};
   const v = String(d.verdict || "").toUpperCase();
   if (v === "PASS" || v === "FAIL") return v;
+  if ("verdict" in d) return null;
   return (/\b(PASS|FAIL)\b/.exec(e.text || "") || [])[1] || null;
 }
 function reviewVerdict(e) {
@@ -1248,7 +1250,7 @@ function renderEvent(e, prev) {
   }
   if (WARN_KINDS.has(k)) {
     return h("div", { class: `warn k-${k}`, "data-id": e.id },
-      h("div", { class: "wh" }, h("span", { class: "wl" }, t("warn." + k)), nameEl(e.actor, type), e.target ? [h("span", { class: "arrow" }, "↔"), nameEl(e.target, handleType(e.target))] : null, task, tm),
+      h("div", { class: "wh" }, h("span", { class: "wl" }, t("warn." + k)), nameEl(e.actor, type), e.target && k !== "security" ? [h("span", { class: "arrow" }, "↔"), nameEl(e.target, handleType(e.target))] : null, task, tm),
       h("div", { class: "sc" }, inlineMd(e.text, false)));
   }
   if (k === "needs_user") {
@@ -1778,6 +1780,14 @@ function renderWho(snap) {
   const ul = clear($("who"));
   if (!rows.length) ul.append(h("li", { class: "one quiet" }, h("div", { class: "top" }, h("i", { class: "dot" }), h("span", { class: "tx" }, t("who.nobody")))));
   rows.forEach(r => ul.append(r));
+  requestAnimationFrame(whoMore);
+}
+function whoMore() {
+  const box = $("who").parentElement, chip = $("whomore");
+  const bottom = box.getBoundingClientRect().bottom;
+  const hidden = [...$("who").children].filter(r => { const b = r.getBoundingClientRect(); return b.height && b.top + b.height / 2 > bottom; }).length;
+  chip.hidden = !hidden;
+  chip.textContent = t("moreNDown", { n: hidden });
 }
 
 const KANBAN = ["waiting_user", "blocked", "todo", "doing", "review", "done", "backlog"];
@@ -1830,7 +1840,7 @@ function drawKanban(cols, w) {
       const model = modelLabel(card.model, card.effort);
       const live = (((S.snap && S.snap.agents) || []).some(a => a.status === "running" && (a.handle === card.owner || a.task === card.id)));
       return h("button", { class: "kcard", "data-task": card.id, style: `--oc:${card.owner ? typeColor(otype, card.owner) : "var(--hair)"}`, title: card.note || card.title, onclick: ev => openDrawer(card.id, ev.currentTarget) },
-        h("span", { class: "k1" }, h("span", { class: "id" }, card.id), h("span", { class: "age" }, shortRel(st === "done" ? (card.finished || card.updated) : (card.since || card.updated || nowS())))),
+        h("span", { class: "k1" }, h("span", { class: "id" }, card.id), card.security ? h("span", { class: "chip sec" }, t("board.security")) : null, h("span", { class: "age" }, shortRel(st === "done" ? (card.finished || card.updated) : (card.since || card.updated || nowS())))),
         h("span", { class: "kt" }, card.title),
         h("span", { class: "k3" }, card.owner ? h("span", { class: "ko", style: `--c:${live ? "var(--ok-mark)" : typeColor(otype, card.owner)}`, title: live ? t("board.workingNow") : null }, h("i"), shortHandle(card.owner)) : h("span", { class: "ko none" }, t("meta.noOwner")), model ? h("span", { class: "chip" }, model) : null));
     }), st === "done" && list.length > 2 ? h("button", { class: "kmore2", onclick: () => { S.collapsed.doneOpen = !S.collapsed.doneOpen; renderBoardPanel(S.snap); } },
@@ -1876,7 +1886,7 @@ function chatItem(e) {
   if (k === "ask") return { ...base, kind: t("kind.ask"), kcls: "ask", cat: "x" };
   if (k === "blocker") return { ...base, kind: t("kind.blocker"), kcls: "bad", cat: "x" };
   if (k === "say") return e.target && e.target !== "all" ? { ...base, kind: t("kind.say"), cat: "x" } : null;
-  if (WARN_KINDS.has(k)) return { ...base, kind: t("warn." + k).toLowerCase(), kcls: "bad", cat: "x" };
+  if (WARN_KINDS.has(k)) return { ...base, to: k === "security" ? null : base.to, kind: t("warn." + k).toLowerCase(), kcls: "bad", cat: "x" };
   return null;
 }
 function appendEvents(list) {
@@ -2011,6 +2021,8 @@ $("filesbtn").addEventListener("click", () => { if (narrow()) setView("files"); 
 $("filesclose").addEventListener("click", () => { toggleFiles(false); $("filesbtn").focus(); });
 $("scrim").addEventListener("click", closeDrawer);
 $("kanban").addEventListener("scroll", kanbanMore);
+$("who").parentElement.addEventListener("scroll", whoMore);
+$("whomore").addEventListener("click", () => { const box = $("who").parentElement; box.scrollBy({ top: box.clientHeight * .8, behavior: "smooth" }); });
 $("kanmore").addEventListener("click", () => $("kanban").scrollBy({ left: $("kanban").clientWidth * .8, behavior: "smooth" }));
 document.addEventListener("keydown", ev => {
   if (ev.key !== "Escape") return;
@@ -2031,7 +2043,7 @@ $("drawer").addEventListener("keydown", ev => {
 let lastNarrow = narrow();
 window.addEventListener("resize", () => {
   const n = narrow();
-  if (S.snap) { renderBoardPanel(S.snap); kanbanMore(); }
+  if (S.snap) { renderBoardPanel(S.snap); kanbanMore(); whoMore(); }
   if (n !== lastNarrow) { lastNarrow = n; if (n) { closeDrawer(); $("files").hidden = false; } else { toggleFiles(false); restoreRituals(); } }
   fitKpis();
 });

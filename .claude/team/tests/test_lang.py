@@ -155,12 +155,14 @@ class AskHeadingTest(unittest.TestCase):
             self.assertTrue(hook.user_asks(text), text)
 
     def test_now_and_later_groups(self):
+        for text in ["**Що від тебе**\n\nЗараз: апрув PR #47.\n\nПізніше:\n- вибрати назву для бакета",
+                     "**What I need from you**\n- approve PR #47\n\nLater:\n- rotate the staging keys"]:
+            self.assertTrue(hook.user_asks(text), text)
         for text in ["**Що від тебе**\n\nЗараз нічого.\n\nПізніше:\n- вибрати назву для бакета\n- відповісти про ліміт",
                      "**Що від тебе**\n\nЗараз нічого — чекай на звіт.\n\nПізніше — без змін: ключі для ротації, дата релізу.",
                      "**What I need from you**\nNothing right now.\n\nLater:\n- rotate the staging keys",
-                     "**What I need from you:** nothing for now.\n\nLater: pick the bucket name."]:
-            self.assertTrue(hook.user_asks(text), text)
-        for text in ["**Що від тебе:** зараз нічого.\n\nДалі запущу тести і відзвітую.",
+                     "**What I need from you:** nothing for now.\n\nLater: pick the bucket name.",
+                     "**Що від тебе:** зараз нічого.\n\nДалі запущу тести і відзвітую.",
                      "**Що від тебе**\n\nЗараз нічого.\n\nПізніше: нічого.",
                      "**What I need from you**\nNothing right now.\n\nI will report after lunch."]:
             self.assertIsNone(hook.user_asks(text), text)
@@ -170,11 +172,12 @@ class AskHeadingTest(unittest.TestCase):
                      "**What I need from you:** nothing.\n\nNext I will run the tests.", "**What I need from you**\nNothing right now.\n\nI will merge it myself.", "**Що від тебе**\nЗараз — нічого.\n\nЗвіт: 3 картки закрито.",
                      "**Що від тебе**\nПоки нічого.\n\nЗараз — чекаю CI, потім відзвітую.", "**What I need from you:** nothing now.\nI will ping you when CI is green.",
                      "**What I need from you**\nNothing — everything is merged now.\n\nLater: I will clean up the branch.",
-                     "**Що від тебе**\nНаразі нічого.\n\n**Рішення**\n- лишив старий API — менше змін"]:
-            self.assertIsNone(hook.user_asks(text), text)
-        for text in ["**Що від тебе:** зараз нічого\n**Пізніше**\n- апрув PR #47", "**Що від тебе**\nЗараз нічого.\n\nПісля релізу:\n- підтвердити ліміт",
+                     "**Що від тебе**\nНаразі нічого.\n\n**Рішення**\n- лишив старий API — менше змін",
+                     "**Що від тебе:** зараз нічого\n**Пізніше**\n- апрув PR #47",
                      "**Що від тебе**\nЗараз нічого.\n\nДалі запущу тести.\n\nПізніше:\n- апрув", "**Що від тебе**\nЗараз нічого.\n\nЗгодом — рішення про ліміт.",
-                     "**Що від тебе:** зараз нічого, пізніше — апрув PR #47.", "**Що від тебе**\nНічого зараз не треба, відпочивай.\n\nПізніше — апрув релізу 2.4.0.",
+                     "**Що від тебе:** зараз нічого, пізніше — апрув PR #47.", "**Що від тебе**\nНічого зараз не треба, відпочивай.\n\nПізніше — апрув релізу 2.4.0."]:
+            self.assertIsNone(hook.user_asks(text), text)
+        for text in ["**Що від тебе**\nЗараз нічого.\n\nПісля релізу:\n- підтвердити ліміт",
                      "**Що від тебе**\n- наразі нічого\n- (опційно) глянь звіт"]:
             self.assertTrue(hook.user_asks(text), text)
 
@@ -195,10 +198,10 @@ class AskHeadingTest(unittest.TestCase):
 
     def test_labelled_lines(self):
         for text in ["**Що від тебе**\n- Зараз: нічого\n- Пізніше: нічого", "**Що від тебе**\nЗараз: нічого.\nПізніше: нічого.",
-                     "**Що від тебе зараз**\n- нічого", "**Що від тебе**\n\n**Зараз**\n- нічого\n\n**Пізніше**\n- нічого"]:
+                     "**Що від тебе зараз**\n- нічого", "**Що від тебе**\n\n**Зараз**\n- нічого\n\n**Пізніше**\n- нічого",
+                     "**Що від тебе**\n- Зараз: нічого\n- Пізніше: апрув PR #47", "**What I need from you**\nNow: nothing.\nLater: approve PR #47."]:
             self.assertIsNone(hook.user_asks(text), text)
-        for text in ["**Що від тебе**\n- Зараз: нічого\n- Пізніше: апрув PR #47", "**Що від тебе**\nЗараз: апрув PR #47.\nПізніше: нічого.",
-                     "**What I need from you**\nNow: nothing.\nLater: approve PR #47.", "**Що від тебе**\n- Запусти apply:"]:
+        for text in ["**Що від тебе**\nЗараз: апрув PR #47.\nПізніше: нічого.", "**Що від тебе**\n- Запусти apply:"]:
             self.assertTrue(hook.user_asks(text), text)
 
     def test_sentence_heading_ending_with_colon(self):

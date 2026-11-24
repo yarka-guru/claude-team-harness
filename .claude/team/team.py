@@ -124,12 +124,13 @@ def cmd_board(con, args):
         print(f"== {LABELS[st]} ({len(items)})")
         for r in items:
             chip = "/".join(x for x in (r["model"], r["effort"]) if x)
-            print(f"  {r['id']:<6} {T.short(r['title'], 80)}  [{r['owner'] or '-'}{' ' + chip if chip else ''}]"
+            mark = T.scope_label(r["id"])
+            print(f"  {r['id']:<6} {T.short(r['title'], 80)}  [{r['owner'] or '-'}{' ' + chip if chip else ''}]{' [' + mark + ']' if mark else ''}"
                   f"{' #' + r['feature'] if r['feature'] else ''}  {ago(r['updated'])}{' — ' + T.short(r['note'], 80) if r['note'] else ''}")
 
 
 def cmd_feed(con, args):
-    kinds = None if args.all else T.CHAT_KINDS + ["dm", "request", "spawn", "stop", "task", "overlap", "conflict", "guard", "needs_user", "ritual"]
+    kinds = None if args.all else T.CHAT_KINDS + ["dm", "request", "spawn", "stop", "task", "overlap", "conflict", "guard", "security", "needs_user", "ritual"]
     q = "SELECT * FROM events"
     params = []
     if kinds:
@@ -152,6 +153,15 @@ def cmd_read(con, args):
             continue
         print(f"#{e['id']} {hhmm(e['ts'])} {e['kind']} {e['actor']} → {e['target'] or 'all'}"
               f"{' [' + e['task'] + ']' if e['task'] else ''}\n{e['text'] or ''}\n")
+
+
+def cmd_needs(con, args):
+    session = None if args.all else (args.session or os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    asks = T.open_asks(con, session)
+    if not asks:
+        print("nothing open")
+    for a in asks:
+        print(T.ask_line(a, args.width))
 
 
 def cmd_who(con, args):
@@ -488,6 +498,10 @@ def main():
     s.add_argument("--all", action="store_true", help="include tool activity")
     s = sub.add_parser("read", help="print team chat or DM messages in full by id")
     s.add_argument("ids", nargs="+")
+    s = sub.add_parser("needs", help="open «Потрібен ти» items: unanswered asks and waiting_user cards")
+    s.add_argument("--session", help="asks of this session (default: the current session)")
+    s.add_argument("--all", action="store_true", help="asks of every session")
+    s.add_argument("--width", type=int, default=200)
     sub.add_parser("who", help="running agents, what they do and which files they hold")
     s = sub.add_parser("release", help="release your file claims")
     s.add_argument("--as", dest="as_")
@@ -531,7 +545,7 @@ def main():
         elif args.cmd in ("ask", "answer", "decision", "blocker", "handoff", "report"):
             cmd_say(con, args, kind=args.cmd)
         else:
-            {"task": cmd_task, "board": cmd_board, "feed": cmd_feed, "read": cmd_read, "who": cmd_who, "release": cmd_release,
+            {"task": cmd_task, "board": cmd_board, "feed": cmd_feed, "read": cmd_read, "needs": cmd_needs, "who": cmd_who, "release": cmd_release,
              "dashboard": cmd_dashboard, "ritual": cmd_ritual, "digest": cmd_digest, "stats": cmd_stats,
              "transcripts": cmd_transcripts, "vacuum": cmd_vacuum, "factcheck": cmd_factcheck}[args.cmd](con, args)
     finally:

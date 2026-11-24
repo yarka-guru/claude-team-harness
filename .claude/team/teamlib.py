@@ -34,6 +34,12 @@ STE_NOTE_SHOWN = 6
 STE_LIMIT = 2.0
 STE_DATA = ("ste_lint.py", "avoid.tsv", "terms.tsv")
 _STE_LINT = {}
+KEEP = Path(os.environ.get("TEAM_KEEP") or ROOT / "keep")
+SCOPE_TEMPLATE = ROOT / "security" / "scope-template.md"
+SECURITY_MODES = ("off", "warn", "deny")
+SECURITY_READERS = {"reviewer", "codex", "researcher", "Explore", "Plan"}
+SECURITY_LABEL = "security"
+SCOPE_MAX = 65536
 
 
 def config_value(key):
@@ -59,12 +65,21 @@ def ste_mode():
     return mode if mode in STE_MODES else "off"
 
 
+def security_mode():
+    mode = os.environ.get("TEAM_SECURITY") or config_value("security")
+    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    return mode if mode in SECURITY_MODES else "deny"
+
+
 LANG = configured_lang()
 TEXT = {
     "guard.fact": ("fact-check: blocked {what} — {reason}", "фактчек: заблоковано {what} — {reason}"),
     "guard.ste_error": ("STE check: the linter failed, the text went through unchecked (see {log})",
                         "STE-перевірка: лінтер впав, текст пропущено без перевірки (див. {log})"),
     "guard.fact_error": ("fact-check: error in {fn}, the call went through unchecked", "фактчек: помилка в {fn}, виклик пропущено без перевірки"),
+    "guard.security_error": ("security gate: error in {fn}, the call went through unchecked",
+                             "безпековий гейт: помилка в {fn}, виклик пропущено без перевірки"),
+    "guard.asks_error": ("open-asks reminder: error in {fn}, no reminder this time", "нагадування про «Потрібен ти»: помилка в {fn}, цього разу без нагадування"),
     "guard.waived": ("fact-check: the lead waived {h} — {reason}", "фактчек: лід пропустив перевірку {h} — {reason}"),
     "guard.git": ("{wt} ({branch}): git operation blocked — {names} editing here", "{wt} ({branch}): заблоковано git-операцію — тут редагує {names}"),
     "conflict": ("{path} — held by {holder} since {since}", "{path} — тримає {holder} з {since}"),
@@ -241,6 +256,41 @@ def emit(con, kind, actor, text="", session=None, agent_id=None, actor_type=None
 
 def max_event(con):
     return con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+
+
+LEAD_ASK_SQL = "COALESCE(json_valid(data) AND json_extract(data,'$.type')='lead_ask', 0)"
+ASK_CLOSED_SQL = "kind='request' OR (kind='session' AND json_valid(data) AND json_extract(data,'$.ended')=1)"
+
+
+def open_asks(con, session=None, upto=None):
+    top = max_event(con) if upto is None else upto
+    where = " AND session IS ?" if session else ""
+    latest = con.execute(f"SELECT * FROM events WHERE id IN (SELECT MAX(id) FROM events WHERE kind='needs_user' AND id<=?{where} "
+                         f"GROUP BY session, agent_id, {LEAD_ASK_SQL}) ORDER BY id", (top, session) if session else (top,)).fetchall()
+    out = []
+    for r in latest:
+        try:
+            data = json.loads(r["data"] or "{}")
+        except ValueError:
+            data = {}
+        lead = isinstance(data, dict) and data.get("type") == "lead_ask"
+        extra = "(kind='tool' AND target='Stop')" if lead else "agent_id = ?"
+        if con.execute(f"SELECT 1 FROM events WHERE id>? AND id<=? AND session IS ? AND ({ASK_CLOSED_SQL} OR {extra}) LIMIT 1",
+                       (r["id"], top, r["session"], *([] if lead else [r["agent_id"]]))).fetchone():
+            continue
+        out.append({"kind": "ask", "id": f"#{r['id']}", "ts": r["ts"], "session": r["session"], "actor": r["actor"],
+                    "type": data.get("type") if isinstance(data, dict) else None, "text": r["text"] or ""})
+    for t in con.execute("SELECT * FROM tasks WHERE status='waiting_user' ORDER BY seq"):
+        out.append({"kind": "card", "id": t["id"], "ts": t["updated"], "session": t["session"], "actor": t["owner"], "type": "waiting_user",
+                    "text": f"{t['title']}{' — ' + t['note'] if t['note'] else ''}"})
+    return out
+
+
+def ask_line(a, width=200):
+    when = time.strftime("%m-%d %H:%M", time.localtime(a["ts"])) if a["ts"] else "?"
+    if a["kind"] == "card":
+        return f"- {a['id']} card waiting_user ({when}): {short(a['text'], width)} — close: {CLI} task done|todo {a['id']} --note \"...\""
+    return f"- {a['id']} {a['type'] or 'needs_user'} by {a['actor']} ({when}): {short(a['text'], width)}"
 
 
 def once(con, key):
@@ -1596,9 +1646,12 @@ def ste_note(message, total):
     return "\n".join(lines[:1] + rows[:STE_NOTE_SHOWN] + more + tail)
 
 
+STE_RUN = {}
+
+
 def ste_check(con, me, tool, kind, text):
     mode = ste_mode()
-    if mode == "off" or not isinstance(text, str) or not text.strip():
+    if mode == "off" or not isinstance(text, str) or not text.strip() or STE_RUN.get("timeout"):
         return None
     try:
         missing = [name for name in STE_DATA if not (ste_dir() / name).is_file()]
@@ -1626,21 +1679,346 @@ def ste_check(con, me, tool, kind, text):
         if decision not in ("warn", "deny") or not message:
             return None
         return decision, str(message) if decision == "deny" else ste_note(str(message), len(hard) + len(soft))
-    except BaseException:
+    except BaseException as e:
+        STE_RUN["timeout"] = STE_RUN.get("timeout") or isinstance(e, TimeoutError)
         ste_log(con, me, traceback.format_exc())
         return None
 
 
-def fail_open(con, me, fn, *args):
+GATE_ERRORS = {"factcheck": ("factcheck-errors.log", "guard.fact_error"), "security": ("security-errors.log", "guard.security_error"),
+               "asks": ("hook-errors.log", "guard.asks_error")}
+
+
+def fail_open(con, me, fn, *args, gate="factcheck"):
     try:
         return fn(con, me, *args)
     except Exception:
         try:
+            log, key = GATE_ERRORS[gate]
             STATE.mkdir(parents=True, exist_ok=True)
-            with open(STATE / "factcheck-errors.log", "a") as f:
+            with open(STATE / log, "a") as f:
                 f.write(time.strftime("%F %T ") + f"{me.get('handle')} {fn.__name__}\n" + traceback.format_exc() + "\n")
-            emit(con, "guard", me["handle"], msg("guard.fact_error", fn=fn.__name__), session=me["session"],
-                   agent_id=me["agent_id"], actor_type=me["type"], task=me.get("task"), data={"gate": "factcheck", "error": True})
+            emit(con, "guard", me["handle"], msg(key, fn=fn.__name__), session=me["session"],
+                   agent_id=me["agent_id"], actor_type=me["type"], task=me.get("task"), data={"gate": gate, "error": True})
         except Exception:
             pass
         return None
+
+
+SCOPE_LINE_MAX = 1000
+SCOPE_PART = re.compile(r"^[ \t]{0,8}(?:(?:>|[-*+]|\d{1,3}[.)]|\[[ xX]?\])[ \t]{0,4})*(?:\*\*|__)?security[ \t]{1,4}scope(?:\*\*|__)?[ \t]{0,4}:", re.I)
+SCOPE_FORMS = "\"Security scope:\", \"- Security scope:\", \"1. Security scope:\", \"> Security scope:\" or \"**Security scope:**\""
+PLACEHOLDER = re.compile(r"<[^<>\n]{0,1000}>")
+CHECKBOX = re.compile(r"\[[ xX]?\]")
+SECURITY_WORDS = re.compile(r"(?i)(?<!\w)(?:exploit\w*|proof[ -]{1,2}of[ -]{1,2}concept|poc|fuzz\w*|port[ -]{0,2}scan\w*|"
+                            r"prompt[ -]{1,2}injection\w*|jailbreak\w*|sandbox[ -]{1,2}(?:escape|probe)\w*|reverse[ -]{1,2}shells?|"
+                            r"pen[ -]?test\w*|penetration[ -]{1,2}test\w*|security[ -]{1,2}audit\w*|vulnerability[ -]{1,2}scan\w*|"
+                            r"guardrail[ -]{1,2}test\w*|escape (?:from )?the container|container[ -]{1,2}escape\w*|nmap|scan the ports)(?!\w)")
+PART_HEAD = re.compile(r"^[ \t]{0,8}(?:#{1,6}[ \t]{1,4}(?P<h>[^\n]{1,200}?)[ \t#:]{0,20}$|"
+                       r"[*_]{0,3}(?P<k>[A-Za-z][A-Za-z /-]{0,40}?)[*_]{0,3}[ \t]{0,4}[*_]{0,3}:)")
+QUIET_PARTS = {"out of scope", "constraints"}
+SCOPE_ITEM = re.compile(r"^[ \t]*(?:[-*+]|\d{1,3}[.)])(?:[ \t]+(.*))?$")
+SCOPE_EMPTY = {"none", "tbd", "todo", "na", "unknown", "tobedecided", "tobedefined"}
+SCOPE_KEYED = re.compile(r"^([^:=—–]{1,40}?)[ \t]*(?:[:=—–]|[ \t]-[ \t])[ \t]*(.*)$")
+SCOPE_HOLDER = re.compile(r"(?i)^(?:none|tbd|todo|n/?a|unknown|to[ \t]+be[ \t]+(?:decided|defined))[ \t]*(?:([,;])|[:—–]|-(?![^\W_])|$)")
+FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+SCOPE_APPROVAL = re.compile(r"(?:(\d{4})-(\d{2})-(\d{2})|(\d{2})\.(\d{2})\.(\d{4}))[ \t]{0,4},?[ \t]{0,4}"
+                            r"(?:«([^«»]*)»|\"([^\"]*)\"|“([^“”]*)”|'([^']*)'|‘([^‘’]*)’)\.?")
+SCOPE_REFUSED = re.compile(r"(?i)^(?:no|nope|nah|not|not[ \t]{1,4}yet|pending|later|wait|hold[ \t]{1,4}on|refused|denied|ні|ще[ \t]{1,4}ні|"
+                           r"поки[ \t]{1,4}ні|не|пізніше|потім|згодом|зачекай|don['’]?t|do[ \t]{1,4}not)(?!\w)|"
+                           r"^(?:відмов|declin|refus|reject|stop|заборон)")
+SCOPE_OWNER = re.compile(r"(?i)^(?:the user|employer, local copy)(?:$|[ \t]{0,4}[.,;:(\-–—])")
+BASH_SCOPE = re.compile(r"keep/{1,8}t-\d+/")
+BASH_WRITE = re.compile(r">|(?<![\w.-])(?:cp|mv|tee|rm|ln|dd|install|touch|truncate|chmod|python[\d.]*|perl|ruby|node)(?![\w-])|"
+                        r"(?<![\w.-])sed(?:[ \t]{1,8}-[a-z]{1,8})*[ \t]{1,8}-[a-z]{0,8}i")
+
+
+def scope_lines_of(text):
+    return [line for line in unfenced(text).split("\n") if SCOPE_PART.match(line)]
+
+
+def scope_line_of(text):
+    return next(iter(scope_lines_of(text)), None)
+
+
+def spawn_card(desc, prompt):
+    text = unix_lines(prompt)
+    line = scope_line_of(text)
+    if line is None:
+        return task_ref(desc, prompt[:300])
+    return task_ref(desc) or task_ref(text.strip().split("\n", 1)[0]) or task_ref(line)
+
+
+def scope_path(tid):
+    return KEEP / tid / "scope.md"
+
+
+def scope_exists(path):
+    try:
+        return path.is_symlink() or path.exists()
+    except OSError:
+        return True
+
+
+def scope_label(tid):
+    return SECURITY_LABEL if tid and scope_exists(scope_path(tid)) else None
+
+
+def unix_lines(text):
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def unfenced(text):
+    out, fence = [], None
+    for line in text.split("\n"):
+        m = FENCE_OPEN.match(line)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not line[m.end():].strip():
+                fence = None
+            out.append("")
+        elif m:
+            fence = m.group(1)
+            out.append("")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def scope_value(text, key):
+    m = re.search(rf"(?im)^[ \t>*_-]{{0,12}}{re.escape(key)}[ \t]{{0,4}}[*_]{{0,3}}[ \t]{{0,4}}:[*_]{{0,3}}[ \t]*(.*)$", text)
+    return m.group(1).strip() if m else None
+
+
+def scope_bare(value):
+    return value.strip(" \t\"'«»*_`")
+
+
+def scope_approval(value):
+    m = SCOPE_APPROVAL.fullmatch(value)
+    if not m:
+        return "does not have the shape: date, comma, the words of the user in quote marks (YYYY-MM-DD, «the words of the user»)"
+    y, mo, d = (m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(6), m.group(5), m.group(4))
+    try:
+        date(int(y), int(mo), int(d))
+    except ValueError:
+        return "has a date that is not valid"
+    words = " ".join(next(g for g in m.groups()[6:] if g is not None).split())
+    if not re.search(r"\w", words):
+        return "has no words of the user in the quote marks"
+    if SCOPE_REFUSED.search(re.sub(r"^[\W_]+", "", words.lower())):
+        return "does not record an approval"
+    return None
+
+
+def scope_clean(text):
+    return " ".join(re.sub(r"[*_`]", "", CHECKBOX.sub(" ", PLACEHOLDER.sub(" ", text))).split())
+
+
+def scope_filled(value):
+    while True:
+        value = re.sub(r"(?<=\S)[ \t]*\([^()]*\)", " ", value).strip()
+        norm = re.sub(r"[\W_]+", "", value).lower()
+        if not norm or norm in SCOPE_EMPTY:
+            return False
+        holder = SCOPE_HOLDER.match(value)
+        if not holder:
+            return True
+        if not holder.group(1):
+            return False
+        value = value[holder.end():].strip()
+        keyed = SCOPE_KEYED.match(value)
+        value = keyed.group(2) if keyed else value
+
+
+def scope_items(text):
+    m = re.search(r"(?ims)^#{1,6}[ \t]{0,4}in scope[ \t]{0,4}$(.*?)(?=^#{1,6}[ \t]|\Z)", text)
+    lines = unfenced(m.group(1)).split("\n") if m else []
+    out = []
+    for i, line in enumerate(lines):
+        item = SCOPE_ITEM.match(line)
+        if not item:
+            continue
+        value = scope_clean(item.group(1) or "")
+        keyed = SCOPE_KEYED.match(value)
+        if keyed:
+            value = keyed.group(2)
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not value and nxt.strip() and not SCOPE_ITEM.match(nxt):
+                value = scope_clean(nxt)
+        if scope_filled(value):
+            out.append(value)
+    return out
+
+
+def scope_problem(path):
+    if path.is_symlink() or path.parent.is_symlink():
+        return "symlink", f"the scope file {path} or its folder is a symbolic link"
+    if not path.is_file():
+        return "no-file", f"the scope file {path} is absent or is not a regular file"
+    try:
+        with open(path, "rb") as f:
+            data = f.read(SCOPE_MAX + 1)
+    except OSError as e:
+        return "unreadable", f"the gate cannot read the scope file {path} ({e.strerror or e})"
+    text = unix_lines(data.decode("utf-8-sig", "replace"))
+    if len(data) > SCOPE_MAX or any(len(line) > SCOPE_LINE_MAX for line in text.split("\n")):
+        return "too-long", f"the scope file {path} is larger than {SCOPE_MAX // 1024} KB or has a line longer than {SCOPE_LINE_MAX} characters"
+    approved = scope_value(text, "Approved by the user")
+    if not approved:
+        return "not-approved", f"the line \"Approved by the user:\" in {path} is absent or empty"
+    if PLACEHOLDER.search(approved):
+        return "not-approved", f"the line \"Approved by the user:\" in {path} has the template placeholder"
+    problem = scope_approval(approved)
+    if problem:
+        return "not-approved", f"the line \"Approved by the user:\" in {path} {problem}"
+    owner = scope_bare(scope_value(text, "Owner of the target") or "")
+    if PLACEHOLDER.search(owner) or not SCOPE_OWNER.match(owner):
+        return "owner", (f"the line \"Owner of the target:\" in {path} does not start with \"the user\" or \"employer, local copy\" "
+                         f"followed by the end of the line or one of . , ; : ( -")
+    if not scope_items(text):
+        return "in-scope", f"the part \"In scope\" in {path} has no filled item"
+    return None
+
+
+def security_words(text):
+    paragraphs, current, part = [], [], None
+    for line in text.split("\n"):
+        m = PART_HEAD.match(line)
+        if m:
+            part = " ".join((m.group("h") or m.group("k")).strip(" *_").lower().split())
+        if part in QUIET_PARTS or not line.strip():
+            paragraphs.append(current)
+            current = []
+        else:
+            current.append(line)
+    paragraphs.append(current)
+    found = set()
+    for lines in paragraphs:
+        found |= {w.group(0).lower() for w in SECURITY_WORDS.finditer(" ".join(" ".join(lines).split()))}
+    return sorted(found)
+
+
+def security_event(con, me, tool, tid, rule, decision, mode, text, path=None):
+    emit(con, "security", me["handle"], short(text, 300), session=me["session"], agent_id=me["agent_id"], actor_type=me["type"],
+         target=tool, task=tid or me.get("task"),
+         data={"rule": rule, "decision": decision, "mode": mode, "tool": tool, "path": str(path) if path else None})
+
+
+def security_note(con, me, tool, tid, rule, mode, text, path):
+    security_event(con, me, tool, tid, rule, "note", mode, text, path)
+    return "warn", text
+
+
+def codex_note(con, me, tool, tid, mode, path):
+    return security_note(con, me, tool, tid, "codex", mode,
+                         f"security: the card {tid} is a security card. Do not give its scope file {path} or the transcripts of the card to codex.",
+                         path)
+
+
+def security_check(con, me, tool, ti, card=None):
+    mode = security_mode()
+    if mode == "off":
+        return None
+    agent = tool == "Agent"
+    raw = ti.get("prompt") if agent else ti.get("message")
+    text = unix_lines(raw) if isinstance(raw, str) else ""
+    if not agent and not text.strip():
+        return None
+    atype = (ti.get("subagent_type") or "general-purpose") if agent else None
+    scope_line = scope_line_of(text)
+    named = task_ref(scope_line or "")
+    if agent:
+        tid = card
+    elif scope_line is not None:
+        tid = named or me.get("task")
+        tid = tid if tid and get_task(con, tid) else None
+    else:
+        tid = task_ref(text) or me.get("task")
+    path = scope_path(tid) if tid else KEEP / "T-<n>" / "scope.md"
+    write = f"write {path} from {SCOPE_TEMPLATE} with the approval of the user before this security run."
+    line = scope_line.strip() if scope_line is not None else None
+    ids = sorted({f"T-{int(n)}" for n in TASK_REF.findall("\n".join(scope_lines_of(text)))}, key=lambda x: int(x[2:]))
+    if len(ids) > 1:
+        return security_verdict(con, me, tool, tid or ids[0], "many-cards", mode,
+                                f"Security gate: the part \"Security scope:\" names {len(ids)} cards ({', '.join(ids)}). The rule is one card id "
+                                f"for each brief: keep only the card of this run in the line and send a separate brief for each other card.",
+                                None, line)
+    if scope_line is not None and not tid:
+        where = "the description" if agent else "the \"Security scope:\" line"
+        return security_verdict(con, me, tool, tid, "no-card", mode,
+                                f"Security gate: the text has the part \"Security scope:\" and no id of a card on the board. "
+                                f"Put the id of a card on the board in {where} and {write}", None, line)
+    if scope_line is not None and named and named != tid:
+        return security_verdict(con, me, tool, tid, "other-card", mode,
+                                f"Security gate: the part \"Security scope:\" names the card {named} and this run belongs to the card {tid}. "
+                                f"Use the scope of {tid}: {write}", path, line)
+    if scope_line is not None:
+        problem = scope_problem(path)
+        if problem:
+            return security_verdict(con, me, tool, tid, problem[0], mode, f"Security gate: {problem[1]}. {write[0].upper()}{write[1:]}", path,
+                                    line)
+        return codex_note(con, me, tool, tid, mode, path) if atype == "codex" else None
+    scoped = bool(tid) and scope_exists(path)
+    if agent and scoped:
+        if atype == "codex":
+            return codex_note(con, me, tool, tid, mode, path)
+        if atype in SECURITY_READERS:
+            return security_note(con, me, tool, tid, "reader", mode,
+                                 f"security: the card {tid} has the scope file {path}. Keep this {atype} run inside the limits of that file, "
+                                 f"or add the part \"Security scope:\" to the brief.", path)
+        return security_verdict(con, me, tool, tid, "no-part", mode,
+                                f"Security gate: the card {tid} has the scope file {path} and the brief has no part \"Security scope:\". "
+                                f"Add the part as a line {SCOPE_FORMS} with the limits from {path} to the brief.", path)
+    words = security_words(text)
+    if not words:
+        return None
+    if scoped:
+        return security_note(con, me, tool, tid, "words", mode,
+                             f"security: the text asks for security work ({', '.join(words)}) on the card {tid}, which has the scope file {path}, "
+                             f"and has no part \"Security scope:\". Add the part as a line {SCOPE_FORMS}.", path)
+    return security_note(con, me, tool, tid, "words", mode,
+                         f"security: the text asks for security work ({', '.join(words)}) and has no part \"Security scope:\". "
+                         f"For a security run, write {path} from {SCOPE_TEMPLATE} with the approval of the user, "
+                         f"and add the part as a line {SCOPE_FORMS}.", path)
+
+
+def security_verdict(con, me, tool, tid, rule, mode, text, path, line=None):
+    if mode == "warn":
+        return security_note(con, me, tool, tid, rule, mode, "security (warn mode, not blocked): " + text, path)
+    security_event(con, me, tool, tid, rule, "deny", mode, text, path)
+    return "deny", f"{short(line, SCOPE_LINE_MAX)}\n{text}" if line else text
+
+
+def scope_target(raw):
+    lexical = Path(os.path.normpath(os.path.abspath(os.path.expanduser(raw))))
+    forms = [lexical, lexical.parent.resolve() / lexical.name, lexical.resolve(), Path(os.path.realpath(os.path.expanduser(raw)))]
+    keeps = {str(KEEP.absolute()).casefold(), str(KEEP.resolve()).casefold(), os.path.normpath(str(KEEP.absolute())).casefold()}
+    for p in forms:
+        if p.name.casefold() == "scope.md" and re.fullmatch(r"t-\d+", p.parent.name.casefold()) and str(p.parent.parent).casefold() in keeps:
+            return p
+    return None
+
+
+def scope_write_check(con, me, tool, ti):
+    mode = security_mode()
+    raw = ti.get("file_path") or ti.get("notebook_path")
+    if mode == "off" or me["lead"] or not isinstance(raw, str) or not raw:
+        return None
+    target = scope_target(raw)
+    if not target:
+        return None
+    return security_verdict(con, me, tool, task_ref(target.parent.name.upper()), "write", mode,
+                            f"Security gate: only the lead writes the scope file {target}. Send the change that you need to the lead.", target)
+
+
+def scope_bash_check(con, me, cmd):
+    if me["lead"] or "scope.md" not in cmd.casefold():
+        return None
+    mode = security_mode()
+    low = cmd.casefold()
+    hit = BASH_SCOPE.search(low)
+    if mode == "off" or not hit or not BASH_WRITE.search(low):
+        return None
+    return security_note(con, me, "Bash", task_ref(hit.group(0).upper()), "write", mode,
+                         "security: this command names a scope file keep/T-<n>/scope.md and a command that can write. Only the lead writes "
+                         "the scope file. If the command changes it, stop and send the change that you need to the lead.", None)

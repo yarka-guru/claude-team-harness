@@ -81,7 +81,7 @@ def on_spawn(con, me, inp, ti):
     desc = ti.get("description") or atype
     prompt = ti.get("prompt") or ""
     model, effort = ti.get("model"), ti.get("effort")
-    tid = T.task_ref(desc, prompt[:300])
+    tid = T.spawn_card(desc, prompt)
     if not T.get_task(con, tid):
         tid = None
     use_id = inp.get("tool_use_id") or f"anon-{T.now()}"
@@ -227,40 +227,78 @@ STE_MAX_COMMAND = 200000
 REDIRECT = re.compile(r"\d*(?:[<>]{1,2}|&>)&?")
 
 
+SHELL_TOKEN = re.compile(r"""'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)|([;&|()])|(\s+)|([^\s'"\\;&|()]+)|(['"])""", re.S)
+
+
+def quoted_segments(cmd):
+    seg, word, quoted, live = [], [], False, False
+    for m in SHELL_TOKEN.finditer(T.strip_heredocs(cmd).replace("\\\n", "").replace("\n", " ; ")):
+        single, double, escaped, sep, space, plain, lone = m.groups()
+        if lone is not None:
+            return
+        if sep is not None or space is not None:
+            if live:
+                seg.append(("".join(word), quoted))
+            word, quoted, live = [], False, False
+            if sep is not None and seg:
+                yield seg
+                seg = []
+            continue
+        if single is not None or double is not None:
+            quoted = quoted or not word
+            word.append(single if single is not None else re.sub(r'\\([\\"])', r"\1", double))
+        else:
+            word.append(escaped if escaped is not None else plain)
+        live = True
+    if live:
+        seg.append(("".join(word), quoted))
+    if seg:
+        yield seg
+
+
 def chat_posts(cmd):
     if "team.py" not in cmd:
         return
-    for seg in T.segments(cmd):
-        if not seg[0].startswith("python"):
+    for seg in quoted_segments(cmd):
+        words = [w for w, _ in seg]
+        off = len(words) - len(T.unwrap(words))
+        env = dict(w.split("=", 1) for w in words[:off] if re.fullmatch(r"[A-Za-z_]\w*=.*", w))
+        seg = seg[off:]
+        if not seg or not seg[0][0].rsplit("/", 1)[-1].startswith("python"):
             continue
-        idx = [i for i, t in enumerate(seg) if t.endswith("team.py")]
-        if not idx or idx[0] + 1 >= len(seg) or seg[idx[0] + 1] not in CHAT_VERBS:
+        idx = [i for i, (t, _) in enumerate(seg) if t.endswith("team.py")]
+        if not idx or idx[0] + 1 >= len(seg) or seg[idx[0] + 1][0] not in CHAT_VERBS:
             continue
-        yield seg[idx[0] + 1:]
+        rest = seg[idx[0] + 1:]
+        if "TEAM_AS" in env and not any(t == "--as" or t.startswith("--as=") for t, _ in rest):
+            rest = rest[:1] + [("--as", False), (env["TEAM_AS"], True)] + rest[1:]
+        yield rest
 
 
 def chat_text(rest):
     words, kind, i = [], None, 1
+    rest = [r if isinstance(r, tuple) else (r, False) for r in rest]
     while i < len(rest):
-        t = rest[i]
+        t, quoted = rest[i]
         opt = t.split("=", 1)[0]
-        if " " not in t and REDIRECT.match(t):
+        if not quoted and " " not in t and REDIRECT.match(t):
             i += 1 if REDIRECT.fullmatch(t) is None else 2
             continue
         if opt in CHAT_OPTIONS:
-            value = t[len(opt) + 1:] if "=" in t else (rest[i + 1] if i + 1 < len(rest) else "")
+            value = t[len(opt) + 1:] if "=" in t else (rest[i + 1][0] if i + 1 < len(rest) else "")
             kind = value if opt == "--kind" else kind
             i += 1 if "=" in t else 2
             continue
         words.append(t)
         i += 1
-    kind = rest[0] if rest[0] != "say" else kind
+    kind = rest[0][0] if rest[0][0] != "say" else kind
     return " ".join(words) if kind in STE_CHAT_KINDS else None
 
 
 def chat_identity(cmd, handle, posts=None):
     for rest in chat_posts(cmd) if posts is None else posts:
         who = None
+        rest = [r[0] if isinstance(r, tuple) else r for r in rest]
         for i, t in enumerate(rest):
             if t == "--as":
                 who = rest[i + 1] if i + 1 < len(rest) else ""
@@ -390,6 +428,7 @@ def stop_block(con, inp, row):
 
 
 def pre_tool(con, inp):
+    T.STE_RUN.clear()
     me = T.identity(con, inp)
     tool = inp.get("tool_name") or ""
     ti = inp.get("tool_input") if isinstance(inp.get("tool_input"), dict) else {}
@@ -397,7 +436,13 @@ def pre_tool(con, inp):
     notes = [n for n in [relink(con, inp, me)] if n]
     if tool == "Agent":
         spawn = on_spawn(con, me, inp, ti)
-        verdict = T.fail_open(con, dict(me, task=spawn[2] or me.get("task")), T.ste_check, tool, "brief", ti.get("prompt"))
+        sme = dict(me, task=spawn[2] or me.get("task"))
+        gate = T.fail_open(con, sme, T.security_check, tool, ti, spawn[2], gate="security")
+        if gate and gate[0] == "deny":
+            drop_spawn(con, spawn)
+            return deny(gate[1])
+        notes += [gate[1]] if gate else []
+        verdict = T.fail_open(con, sme, T.ste_check, tool, "brief", ti.get("prompt"))
         if verdict and verdict[0] == "deny":
             drop_spawn(con, spawn)
             return deny(verdict[1])
@@ -411,12 +456,20 @@ def pre_tool(con, inp):
                task=me.get("task"), data={"message": text, "type": "ask_user_question"})
     elif tool == "SendMessage":
         msg = ti.get("message")
+        gate = T.fail_open(con, me, T.security_check, tool, ti, gate="security")
+        if gate and gate[0] == "deny":
+            return deny(gate[1])
+        notes += [gate[1]] if gate else []
         verdict = T.fail_open(con, me, T.ste_check, tool, "brief", msg) if isinstance(msg, str) else None
         if verdict and verdict[0] == "deny":
             return deny(verdict[1])
         notes += [verdict[1]] if verdict else []
         on_dm(con, me, ti)
     elif tool in T.EDIT_TOOLS:
+        gate = T.fail_open(con, me, T.scope_write_check, tool, ti, gate="security")
+        if gate and gate[0] == "deny":
+            return deny(gate[1])
+        notes += [gate[1]] if gate else []
         T.fail_open(con, me, T.note_authored, tool, ti)
         reason, more = on_edit(con, me, ti)
         if reason:
@@ -424,6 +477,10 @@ def pre_tool(con, inp):
         notes += more
     elif tool == "Bash":
         cmd = ti.get("command") or ""
+        gate = T.fail_open(con, me, T.scope_bash_check, cmd, gate="security")
+        if gate and gate[0] == "deny":
+            return deny(gate[1])
+        notes += [gate[1]] if gate else []
         lint = T.ste_mode() != "off" and len(cmd) <= STE_MAX_COMMAND
         posts = list(chat_posts(cmd)) if lint else None
         bad = None if me["lead"] else chat_identity(cmd, me["handle"], posts)
@@ -618,6 +675,96 @@ def first_line(text):
     return " — ".join([l for l in lines if l][:2])
 
 
+VERDICT_KEY = re.compile(r"\bverdict\b(?:\s+(?:is|stands|remains))?[\s*_:`=—–-]*(?P<v>[^\n]*)", re.I)
+VERDICT_WORD = re.compile(r"\b(PASS(?:ED)?|FAIL(?:ED)?|NOT\s+RUN|NOT\s+COMPLETED)\b")
+VERDICT_ANY = re.compile(r"\b(pass(?:ed|es)?|fail(?:ed|s|ing)?|not\s+run|not\s+completed)\b", re.I)
+VERDICT_FAILED = re.compile(r"\b(?:(\w+)\s+)?failed\b", re.I)
+VERDICT_NEG = {"no", "not", "nothing", "none", "never", "0", "zero"}
+VERDICT_NOT_PASS = re.compile(r"\b(?:not|no|never|cannot|can['’]t|doesn['’]t|didn['’]t|won['’]t|isn['’]t)(?:[^\w.;,:!?'’]+[\w'’]+){0,3}?"
+                              r"[^\w.;,:!?'’]+pass(?:es|ed)?\b", re.I)
+VERDICT_NOT_PASS_UP = re.compile(r"\b(?:NOT|NO)[\s*_`-]+(?:YET[\s*_`-]+)?PASS(?:ED)?\b")
+VERDICT_PASS_FIRST = re.compile(r"^[\W_]*PASS\b")
+VERDICT_BAD = re.compile(r"\b(fail(?:s|ing)?|not\s+run|not\s+completed)\b", re.I)
+VERDICT_PAIR = re.compile(r"\b(?:pass|fail)\s*(?:/|\bor\b)\s*(?:pass|fail)\b", re.I)
+VERDICT_NOT = re.compile(r"^[\W_]*not\s+(?:run|completed)\b", re.I)
+VERDICT_OPEN = re.compile(r"\bverdict[*_`\s]*:[*_`\s]*$|^\s{0,3}#{1,6}\s+[\W_]*verdict[\W_]*$|^[*_\s]*verdict[*_\s]*$", re.I)
+VERDICT_NONE = re.compile(r"\bno\s+(?:final\s+)?verdict\b|\bverdict\b.*\b(?:yet|pending)\b|\bfinal\s+verdict[\W_]*$", re.I)
+VERDICT_HEAD = re.compile(r"^\s{0,3}(#{1,6})\s")
+VERDICT_RANK = {"FAIL": 3, "none": 2, "PASS": 1}
+VERDICT_REACH = 80
+
+
+def verdict_class(text, keep_pair=False, loose=False, bad_only=False, strict_pass=False):
+    probe = text if keep_pair else VERDICT_PAIR.sub("", text)
+    if VERDICT_WORD.search(probe):
+        found = VERDICT_WORD.findall(text)
+        if loose:
+            found += VERDICT_BAD.findall(text)
+            found += ["FAIL" for m in VERDICT_FAILED.finditer(text) if (m.group(1) or "").lower() not in VERDICT_NEG]
+    elif loose and VERDICT_ANY.search(probe):
+        found = [w for w in VERDICT_ANY.findall(text) if w.lower() != "failed" and not (bad_only and w.lower().startswith("pass"))]
+        found += ["FAIL" for m in VERDICT_FAILED.finditer(text) if (m.group(1) or "").lower() not in VERDICT_NEG]
+    else:
+        return None
+    if (VERDICT_NOT_PASS if loose and not strict_pass else VERDICT_NOT_PASS_UP).search(text):
+        found.append("FAIL")
+    found = [w.upper().split()[0] if w.upper().startswith("NOT") else w.upper()[:4] for w in found]
+    if not found:
+        return None
+    if "FAIL" in found:
+        return "FAIL"
+    return "none" if "NOT" in found else "PASS"
+
+
+def verdict_lines(text):
+    lines, n, pos = [], 0, 0
+    for line in (text or "")[:4600].splitlines():
+        lines.append(line[:4000])
+        if pos < 600:
+            n += 1
+        pos += len(line) + 1
+    return lines, n
+
+
+def verdict_body(lines, i, n):
+    head = VERDICT_HEAD.match(lines[i])
+    level = len(head.group(1)) if head else 7
+    body = []
+    for line in lines[i + 1:n]:
+        sub = VERDICT_HEAD.match(line)
+        if sub and len(sub.group(1)) <= level:
+            break
+        if line.strip():
+            body.append(line)
+    return body
+
+
+def parse_verdict(text):
+    lines, n = verdict_lines(text)
+    keyed = []
+    for i, line in enumerate(lines[:n]):
+        m = VERDICT_KEY.search(line)
+        if not m or m.start() > VERDICT_REACH:
+            continue
+        value = m.group("v")
+        if VERDICT_OPEN.search(line):
+            body = verdict_body(lines, i, n)
+            value = " ".join(body)
+            line = " ".join([line] + body)
+        keyed.append((line, value))
+    got = []
+    for line, value in keyed:
+        v = "none" if VERDICT_NOT.match(value) else verdict_class(line, len(keyed) > 1, True, strict_pass=bool(VERDICT_PASS_FIRST.match(value)))
+        if v:
+            got.append(v)
+    if not got and any(VERDICT_NONE.search(line) for line, _ in keyed):
+        return None
+    if not got:
+        first = next((line for line in lines[:n] if line.strip()), "")
+        got = [g for g in [verdict_class(first, False, True, True)] + [verdict_class(line) for line in lines[:n]] if g]
+    return max(got, key=VERDICT_RANK.get) if got else None
+
+
 def subagent_stop(con, inp):
     aid = inp.get("agent_id")
     row = T.agent_row(con, aid)
@@ -641,8 +788,7 @@ def subagent_stop(con, inp):
     t = T.now()
     con.execute("UPDATE agents SET status='done', stopped=?, last_ts=?, result=? WHERE agent_id=?", (t, t, res[:4000], aid))
     con.execute("DELETE FROM claims WHERE agent_id=?", (aid,))
-    m = re.search(r"\b(PASS|FAIL)\b", res[:600])
-    verdict = m.group(1) if m and row["type"] in ("reviewer", "codex") else None
+    verdict = parse_verdict(res) if row["type"] in ("reviewer", "codex") else None
     T.emit(con, "stop", row["handle"], T.short(first_line(res), 300), session=row["session"], agent_id=aid, actor_type=row["type"],
            task=row["task"], data={"duration_s": int(t - (row["started"] or t)), "tools": row["tools"], "result": res[:2000], "verdict": verdict})
     task = T.get_task(con, row["task"])
@@ -733,7 +879,7 @@ HANDBACK = re.compile(r'^\s*<agent-message from="([^"]+)">\s*\[Subagent hand-bac
 ASK_HEAD = re.compile(r"^\W*(що від тебе|на тобі|від тебе|твій крок|що лишилось тобі)\b", re.I)
 NEGATED = re.compile(r"нічого|не потрібно|не треба|не висить", re.I)
 EN_HEAD = re.compile(r"^ {0,3}(?:#{1,6}\s+)?(?:\d{1,2}[.)]\s+|[-*•]\s+)?[*_]{0,3}\s*(what i need from you|your steps?)(?!\w)(?P<tail>.*)$", re.I)
-HEAD_SUFFIX = re.compile(r"[*_]*\s*(?:\([^)]{1,24}\)|(?:now|today|later|зараз|сьогодні|потім)(?!\w))?", re.I)
+HEAD_SUFFIX = re.compile(r"[*_]*\s*(?:\([^)]{1,24}\)|(?:later\s+today|пізніше\s+сьогодні|now|today|later|зараз|сьогодні|потім)(?!\w))?", re.I)
 NOWQ = r"(?:зараз|наразі|поки(?:\s+що)?|right\s+now|for\s+now|at\s+the\s+moment|now)"
 NEGW = r"(?:нічого|не\s+треба|не\s+потрібно|nothing|none|not\s+needed|no\s+action(?:\s+(?:needed|required))?)"
 NEG = re.compile(r"(?:(?:зараз|поки(?:\s+що)?|наразі|від\s+тебе)\s+)?" + NEGW + r"(?!\w)", re.I)
@@ -747,12 +893,27 @@ ASKY = re.compile(r"\?|`!\s|^!\s|^(?:продуктове|product)\b|^" + LEADS 
 HEAD_FORM = re.compile(r"^\W*(?:що від тебе|на тобі|від тебе|твій крок|що лишилось тобі)[*_\s]*(?::|$)", re.I)
 BULLET = re.compile(r"^\s*(?:(?:[-*•—–]|\d{1,2}[.)])(?:\s+|$))+")
 SECTION = re.compile(r"рішення|ідеї|перевір|результат|що є|рев'ю|ризики|далі|\bdecisions?\b|\bideas\b|\bcheck|\bresults?\b|\breview\b|\brisks\b|\bnext\b", re.I)
+FULL_SECTION = re.compile(r"^[\W_]*(?:статус|status|примітк[аи]?|notes?)[\W_]*$", re.I)
 SUBHEAD = re.compile(r"^\s{0,3}(#{1,6}\s+.*|\*\*[^*]+\*\*\s*:?|__[^_]+__\s*:?)\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-GROUP = re.compile(r"^[*_\s]*(?P<label>зараз|пізніше|потім|згодом|now|later)[*_]*\s*(?:(?:[:—–]|\s-\s)[*_\s]*(?P<rest>.*))?$", re.I)
+GROUP = re.compile(r"^[*_\s]*(?P<label>(?:пізніше|later)\s+(?:сьогодні|today)|(?:(?:а|на)\s+)?зараз|сьогодні|терміново|до\s+\d{1,2}[:.]\d{2}|"
+                   r"today|urgent|right\s+now|asap|пізніше|потім|згодом|now|later)[*_]*\s*(?:(?:[:—–]|\s-\s)[*_\s]*(?P<rest>.*))?$", re.I)
 LATER = re.compile(r"пізніше|потім|згодом|later", re.I)
-SHORT_LABEL = re.compile(r"^[*_\s]*(?:\S+\s+){0,3}\S+?[*_]*:[*_\s]*$")
+NOW_PLAIN = re.compile(r"зараз|now", re.I)
+NUMBERED = re.compile(r"^\s*\d{1,2}[.)]\s")
+HEAD_MARK = re.compile(r"^\s{0,3}#{1,6}\s+")
+LATER_FROM = re.compile(r"^[*_\s]*(?:(?:пізніше|потім|згодом)\s+від\s+тебе|later\s+from\s+you)(?!\w)", re.I)
+HEAD_LATER = re.compile(r"^\W*(?:що від тебе|від тебе|на тобі|твій крок|what i need from you|your steps?)[*_\s]*(?:пізніше|потім|згодом|later)(?!\w)(?!\s+(?:сьогодні|today))", re.I)
 USER_NOTIFY = {"permission_prompt", "elicitation_dialog"}
+DONE_WORDS = re.compile(r"(?<!\w)(?<!не )(?<!not )(?:зробив|зробила|апрувнув|апрувнула|апрувед|відправив|відправила|залогінився|залогінилась|запустив|запустила|видалив|видалила|додав|додала|готово|done|approved|sent)(?!\w)", re.I)
+SENTENCE_END = re.compile(r"[.!?\n]")
+
+
+def short_label(text):
+    core = text.strip().rstrip("*_ \t")
+    head = core[:-1].rstrip("*_") if core.endswith(":") else ""
+    words = head.split()
+    return bool(head) and not head[-1].isspace() and 0 < len(words) <= 4 and bool(words[0].lstrip("*_"))
 
 
 def load_data(raw):
@@ -767,8 +928,7 @@ def fill_stop(con, a, e, body):
     data = load_data(e["data"])
     data["result"] = body[:2000]
     if a["type"] in ("reviewer", "codex"):
-        v = re.search(r"\b(PASS|FAIL)\b", body[:600])
-        data["verdict"] = v.group(1) if v else None
+        data["verdict"] = parse_verdict(body)
     summary = T.short(first_line(body), 300)
     con.execute("UPDATE events SET text=?, data=? WHERE id=?", (summary, json.dumps(data, ensure_ascii=False), e["id"]))
     con.execute("UPDATE agents SET result=COALESCE(NULLIF(result,''), ?) WHERE agent_id=?", (body[:4000], a["agent_id"]))
@@ -797,18 +957,43 @@ def backfill_report(con, session, prompt):
     fill_stop(con, a, e, body)
 
 
+def done_said(prompt):
+    for m in DONE_WORDS.finditer(prompt):
+        end = SENTENCE_END.search(prompt, m.end())
+        if not end or end.group(0) != "?":
+            return True
+    return False
+
+
+def done_note(con, me, prompt):
+    if not done_said(prompt[:2000]):
+        return None
+    asks = T.open_asks(con, me["session"])
+    if not asks:
+        return None
+    lines = [T.ask_line(a) for a in asks[:12]]
+    if len(asks) > 12:
+        lines.append(f"- … and {len(asks) - 12} more: {T.CLI} needs")
+    return ("Open-asks reminder: the user reports a finished step. These «Потрібен ти» items are open now (asks of this session and "
+            "waiting_user cards):\n" + "\n".join(lines) + "\nClose each item the user answered before new work: move its card with "
+            f"`{T.CLI} task done|todo T-n`, and leave answered asks out of the next «Що від тебе» block. Check the list again with `{T.CLI} needs`.")
+
+
 def prompt_submit(con, inp):
     me = T.identity(con, inp)
     ensure_row(con, me, inp)
     con.execute("UPDATE agents SET status='running', last_ts=? WHERE agent_id=?", (T.now(), me["agent_id"]))
     prompt = inp.get("prompt") or ""
     backfill_report(con, me["session"], prompt)
-    if prompt.strip() and not prompt.lstrip().startswith("<"):
+    user = bool(prompt.strip()) and not prompt.lstrip().startswith("<")
+    notes = [T.fail_open(con, me, done_note, prompt, gate="asks")] if me["lead"] and user else []
+    if user:
         T.emit(con, "request", "user", prompt[:1500], session=me["session"], target="lead", task=T.task_ref(prompt[:300]))
     if me["lead"]:
         lead_tab(con, inp, "work")
-    box = inbox(con, me)
-    return ctx("UserPromptSubmit", box) if box else None
+    notes.append(inbox(con, me))
+    notes = [n for n in notes if n]
+    return ctx("UserPromptSubmit", "\n".join(notes)) if notes else None
 
 
 def en_heading(line):
@@ -860,52 +1045,78 @@ def fence_end(lines, j, mark):
     return k
 
 
-def answer(text, items):
+def add_item(items, nows, text, later):
+    items.append(text)
+    if not later:
+        nows.append(text)
+
+
+def clause_later(clause):
+    m = re.match(r"[,;.]\s*(?:а\s+|and\s+)?(\w+)(?:\s+(\w+))?", clause.group(0), re.I)
+    return bool(m and LATER.fullmatch(m.group(1)) and (m.group(2) or "").lower() not in ("сьогодні", "today"))
+
+
+def pure_label(text):
+    g = GROUP.match(text.strip(" *_"))
+    if not g or (g.group("rest") or "").strip(" *_"):
+        return None
+    return bool(LATER.fullmatch(g.group("label")))
+
+
+def answer(text, items, nows, later=False):
     text = text.strip(" *_")
     if not text:
+        return "open"
+    if LATER_FROM.match(text):
+        add_item(items, nows, text, True)
         return "open"
     g = GROUP.match(text)
     if g:
         rest = (g.group("rest") or "").strip(" *_")
-        later = bool(LATER.fullmatch(g.group("label")))
+        label_later = bool(LATER.fullmatch(g.group("label")))
         if rest and not negated(rest):
-            items.append(rest)
+            add_item(items, nows, rest, label_later)
             return "open"
-        if later:
+        if label_later:
             return "open"
         return "wait" if rest else "open"
     if NOW_NEG.match(text):
         clause = LATER_CLAUSE.search(text)
-        later = clause and (clause.group("rest") or clause.group("rest2"))
-        if later and not negated(later):
-            items.append(later)
+        rest = clause and (clause.group("rest") or clause.group("rest2"))
+        if rest and not negated(rest):
+            add_item(items, nows, rest, clause_later(clause))
             return "open"
         return "wait"
     if negated(text):
         return "stop"
-    items.append(text)
+    add_item(items, nows, text, later)
     return "open"
 
 
 def ask_block(lines, i, rest, line_negated):
-    block, items = [lines[i]], []
+    block, items, nows = [lines[i]], [], []
+    later = bool(HEAD_LATER.match(lines[i]))
     state = "open"
     if rest:
-        state = answer(rest, items)
+        state = answer(rest, items, nows, later)
+        label = pure_label(rest)
+        later = later if label is None else label
     elif line_negated:
         state = "stop"
     if line_negated and state == "open" and items and not (NOW_NEG.match(rest) or GROUP.match(rest)):
         return None
     if state == "stop":
         return None
-    j, seen_list, blank = i + 1, False, False
+    j, seen_list, blank, later_list, since = i + 1, False, False, False, 0
     while j < len(lines) and j < i + 40:
         nxt = lines[j]
         fm = FENCE.match(nxt)
         if fm:
             k = fence_end(lines, j, fm.group(1))
             block += lines[j:k + 1]
-            items += [c for c in lines[j + 1:k] if c.strip()]
+            for c in lines[j + 1:k]:
+                if c.strip():
+                    add_item(items, nows, c, later)
             j, blank = k + 1, False
             state = "open" if state == "wait" else state
             continue
@@ -914,57 +1125,87 @@ def ask_block(lines, i, rest, line_negated):
             j += 1
             continue
         if SUBHEAD.match(nxt):
-            if SECTION.search(nxt) and not GROUP.match(nxt):
+            later_list = False
+            bare = HEAD_MARK.sub("", nxt)
+            label = GROUP.match(bare)
+            if (SECTION.search(nxt) or FULL_SECTION.match(bare)) and not label:
                 break
-            label = GROUP.match(nxt)
-            if label and LATER.fullmatch(label.group("label")) or SHORT_LABEL.match(nxt):
-                state = "open"
+            if label:
+                later = bool(LATER.fullmatch(label.group("label")))
+                before = len(items)
+                result = answer(bare, items, nows, later)
+                if result == "wait" and not items:
+                    state = "wait"
+                elif later or len(items) > before:
+                    state = "open"
+                if not later:
+                    seen_list, blank, since = False, False, len(items)
+            elif later and len(bare.strip(" *_:").split()) <= 4:
+                later, seen_list, blank, since = False, False, False, len(items)
+            elif short_label(nxt):
+                state, later = "open", False
             block.append(nxt)
             j += 1
             continue
         text = BULLET.sub("", nxt).strip()
         is_list = bool(BULLET.match(nxt)) or nxt.startswith(("  ", "\t")) and seen_list
         g = GROUP.match(text)
-        if state == "wait" and g and not LATER.fullmatch(g.group("label")):
+        if state == "wait" and g and NOW_PLAIN.fullmatch(g.group("label")):
+            later = False
             j += 1
             continue
-        if g or (state == "wait" and SHORT_LABEL.match(text)):
+        if g or (state == "wait" and short_label(text)):
+            later_list = False
             if g:
                 before = len(items)
-                result = answer(text, items)
+                result = answer(text, items, nows, later)
                 if result == "wait" and not items and not is_list:
                     state = "wait"
                 elif LATER.fullmatch(g.group("label")) or len(items) > before:
                     state = "open"
+                label = pure_label(text)
+                later = later if label is None else label
             else:
-                state = "open"
+                state, later = "open", False
             block.append(nxt)
-            seen_list, blank = seen_list or is_list, False
+            fresh = g and not is_list and not LATER.fullmatch(g.group("label"))
+            seen_list, blank = (False if fresh else seen_list or is_list), False
+            since = len(items) if fresh else since
             j += 1
             continue
         if state == "wait":
             if is_list or ASKY.search(text):
                 block.append(nxt)
-                items.append(nxt)
+                add_item(items, nows, nxt, later)
                 seen_list = seen_list or is_list
             j += 1
             continue
-        if not is_list and (seen_list or (blank and items)):
+        if later and not is_list and short_label(text) and not SECTION.search(text):
+            if FULL_SECTION.match(text):
+                break
+            later, seen_list, blank, later_list, since = False, False, False, False, len(items)
+            block.append(nxt)
+            j += 1
+            continue
+        if not is_list and (seen_list or (blank and len(items) > since)):
             break
         if not is_list and not items:
-            result = answer(text, items)
+            result = answer(text, items, nows, later)
             if result == "stop":
                 return None
             block.append(nxt)
             state, blank = result, False
             j += 1
             continue
+        if later and blank and later_list and NUMBERED.match(nxt):
+            later = False
         block.append(nxt)
-        items.append(nxt)
+        add_item(items, nows, nxt, later)
+        later_list = later and is_list
         seen_list = seen_list or bool(BULLET.match(nxt))
         blank = False
         j += 1
-    if items and not all(negated(x) for x in items):
+    if nows and not all(negated(x) for x in nows):
         return "\n".join(block).strip()
     return None
 
